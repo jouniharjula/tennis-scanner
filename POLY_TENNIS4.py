@@ -3,12 +3,16 @@
 Polymarket ATP + WTA Tennis Real-Time Signal Engine
 Six-case alerts with explicit trade actions, delivered via ntfy.
 Observe-only — no orders are placed.
+
+Wrapped in a minimal Flask app so Render's Web Service health check passes.
+The scanner runs in a daemon thread alongside the Flask server.
 """
 
 import os
 import time
 import json
 import warnings
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -16,6 +20,7 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 
 import pandas as pd
+from flask import Flask
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -48,8 +53,11 @@ NTFY_CIRCUIT_BREAKER_THRESHOLD = 300.0
 # SCANNER CONFIGURATION
 # ============================================================================
 
-# ROTATE THIS KEY — it was exposed earlier.
-LIVETENNIS_API_KEY = "twjp_fb6099bc479d519a016dc727e174ba60"
+# ROTATE THIS KEY — it was exposed earlier. Prefer setting it via Render env var.
+LIVETENNIS_API_KEY = os.environ.get(
+    "LIVETENNIS_API_KEY",
+    "twjp_fb6099bc479d519a016dc727e174ba60",
+)
 
 POLL_INTERVAL_SECONDS = 130
 ALERT_COOLDOWN_SECONDS = 300
@@ -79,14 +87,6 @@ MARKOV_DIVERGENCE = 0.06
 # ============================================================================
 
 class NtfyClient:
-    """
-    Delivery wrapper for ntfy.sh with:
-      - per-message min gap (NTFY_MIN_GAP_SEC)
-      - chunk splitting (MAX_NTFY_LENGTH) with inter-chunk delay
-      - retry with backoff (NTFY_MAX_ATTEMPTS)
-      - circuit breaker if a send stalls beyond threshold
-    """
-
     def __init__(self):
         self._last_send_ts = 0.0
 
@@ -112,7 +112,6 @@ class NtfyClient:
         remaining = text
         while remaining:
             cut = min(MAX_NTFY_LENGTH, len(remaining))
-            # try to break on newline
             if cut < len(remaining):
                 nl = remaining.rfind("\n", 0, cut)
                 if nl > MAX_NTFY_LENGTH * 0.5:
@@ -146,7 +145,6 @@ class NtfyClient:
 
     def send(self, title: str, body: str, priority: str = "default",
              tags: str = "") -> bool:
-        """Send with chunking, retry, min-gap, and circuit breaker."""
         chunks = self._chunk(body)
         total = len(chunks)
         all_ok = True
@@ -540,7 +538,6 @@ DIRECTION_PRIORITY = {"fade": "high", "follow": "high", "info": "default"}
 
 
 def format_ntfy_body(sig: Signal, s: MarketSnapshot) -> str:
-    """Human-readable alert body for ntfy."""
     lines = [
         f"Tour:    {s.tour}",
         f"Market:  {s.question}",
@@ -609,7 +606,6 @@ class TennisBollingerScanner:
         if not self.cooldown_ok(key):
             return
 
-        # Local console output (unchanged format)
         bar = "=" * 68
         icon = DIRECTION_ICON[sig.direction]
         print(f"\n{bar}")
@@ -630,7 +626,6 @@ class TennisBollingerScanner:
             print(f"  Details:   {sig.details}")
         print(f"{bar}\n")
 
-        # ntfy push
         title = f"{icon} {sig.case_id} — {s.tour}"
         body = format_ntfy_body(sig, s)
         tags = DIRECTION_TAG.get(sig.direction, "")
@@ -739,5 +734,43 @@ class TennisBollingerScanner:
             time.sleep(POLL_INTERVAL_SECONDS)
 
 
+# ============================================================================
+# FLASK WRAPPER — keeps Render's Web Service health check happy
+# ============================================================================
+
+app = Flask(__name__)
+_scanner_thread: Optional[threading.Thread] = None
+
+
+def _start_scanner_once():
+    global _scanner_thread
+    if _scanner_thread is not None and _scanner_thread.is_alive():
+        return
+    scanner = TennisBollingerScanner()
+    _scanner_thread = threading.Thread(target=scanner.run, daemon=True)
+    _scanner_thread.start()
+    print(f"[{datetime.now()}] Scanner thread started")
+
+
+@app.route("/")
+def root():
+    _start_scanner_once()
+    return "Tennis scanner is running", 200
+
+
+@app.route("/health")
+def health():
+    _start_scanner_once()
+    alive = _scanner_thread is not None and _scanner_thread.is_alive()
+    return {"status": "ok" if alive else "starting",
+            "scanner_thread_alive": alive}, 200
+
+
+# Start the scanner as soon as the module is imported by gunicorn,
+# so it's already running before the first HTTP request arrives.
+_start_scanner_once()
+
+
 if __name__ == "__main__":
-    TennisBollingerScanner().run()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
