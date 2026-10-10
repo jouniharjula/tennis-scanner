@@ -4,7 +4,7 @@ Polymarket ATP + WTA Tennis Real-Time Signal Engine
 Six-case alerts with explicit trade actions, delivered via ntfy.
 Observe-only — no orders are placed.
 
-Wrapped in a minimal Flask app so Render's Web Service health check passes.
+Wrapped in a minimal  Flask app so Render's Web Service health check passes.
 The scanner runs in a daemon thread alongside the Flask server.
 """
 
