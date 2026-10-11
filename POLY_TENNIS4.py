@@ -954,6 +954,16 @@ def root():
     return "Tennis scanner is running", 200
 
 
+
+@app.route("/scanner-status")
+def scanner_status():
+    import traceback
+    if _scanner_thread is None:
+        return {"scanner": "not started"}, 500
+    if not _scanner_thread.is_alive():
+        return {"scanner": "dead"}, 500
+    return {"scanner": "alive"}, 200
+
 @app.route("/health")
 def health():
     _start_scanner_once()
