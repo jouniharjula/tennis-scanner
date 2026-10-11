@@ -18,6 +18,15 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+import functools
+
+# Force print to flush after every call (Render buffers stdout otherwise)
+_print = print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _print(*args, **kwargs)
+
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from polymarket_tennis import (
@@ -700,6 +709,8 @@ class TennisBollingerScanner:
         self.live_client: Optional[LiveTennisClient] = None
 
     def initialize(self):
+
+        print(f"[{datetime.now()}] initialize() entered", flush=True)
         key = (LIVETENNIS_API_KEY or "").strip()
         if not key:
             raise ValueError("LIVETENNIS_API_KEY not set.")
