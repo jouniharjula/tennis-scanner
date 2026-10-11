@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
 Polymarket ATP + WTA Tennis Real-Time Signal Engine
-Six-case alerts with explicit trade actions, delivered via ntfy.
+Six-case alerts for LIVE matches only, with per-case cooldowns.
 Observe-only — no orders are placed.
-
-Wrapped in a minimal  Flask app so Render's Web Service health check passes.
-The scanner runs in a daemon thread alongside the Flask server.
 """
 
 import os
 import time
 import json
 import warnings
-import threading
 import urllib.request
+import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 
 import pandas as pd
-from flask import Flask
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -29,8 +25,8 @@ from polymarket_tennis import (
     LiveTennisClient,
     discover_tennis_markets,
     match_market,
+    build_view,
 )
-from vibe_trading_livetennis import DataLoader
 
 # ============================================================================
 # NTFY CONFIGURATION
@@ -42,10 +38,8 @@ NTFY_USERNAME = os.environ.get("NTFY_USERNAME", "")
 NTFY_PASSWORD = os.environ.get("NTFY_PASSWORD", "")
 
 MAX_NTFY_LENGTH = 3900
-
 NTFY_MIN_GAP_SEC = 1.5
 NTFY_INTER_CHUNK_DELAY = 2.0
-NTFY_INTER_COIN_DELAY = 1.5
 NTFY_MAX_ATTEMPTS = 3
 NTFY_CIRCUIT_BREAKER_THRESHOLD = 300.0
 
@@ -53,17 +47,15 @@ NTFY_CIRCUIT_BREAKER_THRESHOLD = 300.0
 # SCANNER CONFIGURATION
 # ============================================================================
 
-# ROTATE THIS KEY — it was exposed earlier. Prefer setting it via Render env var.
 LIVETENNIS_API_KEY = os.environ.get(
     "LIVETENNIS_API_KEY",
     "twjp_fb6099bc479d519a016dc727e174ba60",
 )
 
 POLL_INTERVAL_SECONDS = 130
-ALERT_COOLDOWN_SECONDS = 300
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2.0
-CANDLE_INTERVAL = "1min"
+RESAMPLE_INTERVAL = "5min"
 HISTORY_HOURS = 3
 
 TOUR_FILTERS = ("atp", "wta")
@@ -80,7 +72,140 @@ ENABLED_CASES = {
 CHANGEOVER_THRESHOLD_S = 85
 VOL_HIGH_IQR = 0.04
 VOL_LOW_IQR = 0.015
+MIN_IQR = 0.001
 MARKOV_DIVERGENCE = 0.06
+
+# C4 low-vol FOLLOW requires the score to have moved within this many
+# seconds, otherwise the "meaningful" touch is treated as informational
+C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 3
+
+# ----------------------------------------------------------------------------
+# PER-CASE COOLDOWNS (seconds)
+# ----------------------------------------------------------------------------
+DEFAULT_ALERT_COOLDOWN_SECONDS = 300
+CASE_SPECIFIC_COOLDOWN = {
+    "C1_BREAKPOINT_CONTEXT":  600,
+    "C2_SCORE_DRIVEN":        600,
+    "C3_TIMEBREAK_NOISE":     900,
+    "C4_VOLATILITY_ADJUSTED": 180,
+    "C5_MARKOV_FAIRVALUE":    900,
+    "C6_FAVORITE_LONGSHOT":   600,
+}
+
+# ============================================================================
+# API ENDPOINTS AND CACHES
+# ============================================================================
+
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_PRICES_URL = "https://clob.polymarket.com/prices-history"
+
+_GAMMA_TOKEN_CACHE: Dict[str, Optional[List[str]]] = {}
+
+
+def _gamma_lookup_token_ids(slug: str) -> Optional[List[str]]:
+    if slug in _GAMMA_TOKEN_CACHE:
+        return _GAMMA_TOKEN_CACHE[slug]
+
+    try:
+        params = urllib.parse.urlencode({"slug": slug})
+        url = f"{GAMMA_MARKETS_URL}?{params}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "tennis-scanner/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        if not isinstance(data, list) or not data:
+            _GAMMA_TOKEN_CACHE[slug] = None
+            return None
+
+        raw = data[0].get("clobTokenIds")
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, list) or not raw:
+            _GAMMA_TOKEN_CACHE[slug] = None
+            return None
+
+        _GAMMA_TOKEN_CACHE[slug] = raw
+        return raw
+
+    except Exception as e:
+        print(f"  ! gamma lookup error for {slug}: {e}")
+        _GAMMA_TOKEN_CACHE[slug] = None
+        return None
+
+
+def extract_token_id(market) -> Optional[str]:
+    slug = getattr(market, "slug", None)
+    if not slug:
+        return None
+    tokens = _gamma_lookup_token_ids(slug)
+    if not tokens:
+        return None
+    return tokens[0]
+
+
+# ============================================================================
+# PRICE HISTORY
+# ============================================================================
+
+def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS
+                        ) -> Optional[pd.DataFrame]:
+    end_ts = int(time.time())
+    start_ts = end_ts - (hours_back * 3600)
+
+    params = urllib.parse.urlencode({
+        "market": token_id,
+        "startTs": start_ts,
+        "endTs": end_ts,
+        "fidelity": 1,
+    })
+    url = f"{CLOB_PRICES_URL}?{params}"
+
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "tennis-scanner/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"  ! history fetch error: {e}")
+        return None
+
+    if isinstance(data, dict):
+        history = data.get("history", [])
+    elif isinstance(data, list):
+        history = data
+    else:
+        return None
+
+    if not history:
+        return None
+
+    rows = []
+    for pt in history:
+        try:
+            if "t" in pt and "p" in pt:
+                rows.append({"timestamp": pt["t"], "close": float(pt["p"])})
+        except Exception:
+            continue
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    df = (df.set_index("timestamp")
+            .resample(RESAMPLE_INTERVAL)
+            .last()
+            .dropna()
+            .reset_index()
+            .sort_values("timestamp")
+            .reset_index(drop=True))
+
+    print(f"  [fetch] {len(rows)} raw -> {len(df)} resampled points")
+    return df
+
 
 # ============================================================================
 # NTFY CLIENT
@@ -151,7 +276,6 @@ class NtfyClient:
 
         for i, chunk in enumerate(chunks, 1):
             part_title = title if total == 1 else f"{title} ({i}/{total})"
-
             self._wait_for_slot()
             start = time.monotonic()
             ok = False
@@ -366,6 +490,11 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
     tail = pd.Series(s.recent_prices[-BOLLINGER_PERIOD:])
     q1, q3 = float(tail.quantile(0.25)), float(tail.quantile(0.75))
     iqr = q3 - q1
+
+    if iqr < MIN_IQR:
+        return None
+
+    # High-vol regime: informational only, unchanged
     if iqr >= VOL_HIGH_IQR:
         return Signal(
             case_id="C4_VOLATILITY_ADJUSTED", direction="info",
@@ -375,15 +504,33 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
             confidence="LOW",
             details={"iqr": iqr, "regime": "high"},
         )
+
+    # Low-vol regime: require recent score activity for a FOLLOW signal
     if iqr <= VOL_LOW_IQR:
+        recently_active = (
+            s.last_score_change_ts is not None
+            and (datetime.now() - s.last_score_change_ts).total_seconds()
+                <= C4_RECENT_ACTIVITY_WINDOW_S
+        )
+        if not recently_active:
+            return Signal(
+                case_id="C4_VOLATILITY_ADJUSTED", direction="info",
+                title=f"{s.touch.upper()} TOUCH IN LOW-VOL (STALE)",
+                reason=(f"IQR={iqr:.4f} low but no recent score activity. "
+                        "Quiet market — touch is likely noise."),
+                trade_action="IGNORE — no score context to justify FOLLOW.",
+                confidence="LOW",
+                details={"iqr": iqr, "regime": "low-stale"},
+            )
         return Signal(
             case_id="C4_VOLATILITY_ADJUSTED", direction="follow",
             title=f"{s.touch.upper()} TOUCH IN LOW-VOL REGIME",
             reason=f"IQR={iqr:.4f} (low). Band touch is meaningful.",
             trade_action=f"FOLLOW. Buy the {s.touch} band touch side.",
             confidence="MEDIUM",
-            details={"iqr": iqr, "regime": "low"},
+            details={"iqr": iqr, "regime": "low-active"},
         )
+
     return None
 
 
@@ -463,7 +610,7 @@ def run_all_cases(s: MarketSnapshot) -> List[Signal]:
 
 
 # ============================================================================
-# DISCOVERY
+# DISCOVERY — LIVE MATCHES ONLY
 # ============================================================================
 
 def discover_tennis_markets_all() -> List:
@@ -480,52 +627,26 @@ def discover_tennis_markets_all() -> List:
 
 
 def match_markets_to_live(markets, live_client):
-    candidates = live_client.live_matches() + live_client.fixtures()
+    """
+    Match Polymarket markets to LIVE matches only. Fixtures (upcoming
+    matches) are excluded so pre-match markets don't pollute signals.
+    """
+    live = live_client.live_matches()
+    print(f"  [match] {len(live)} live matches from Live Tennis API")
+
     paired = []
     for m in markets:
         try:
-            d = match_market(m, candidates)
+            d = match_market(m, live)
             if d and d.match:
                 paired.append({"market": m, "match": d.match,
                                "confidence": d.confidence})
+                print(f"  [match] + {m.slug}")
+            else:
+                print(f"  [match] - {m.slug} (not live)")
         except Exception as e:
-            print(f"  ! match error: {e}")
+            print(f"  ! match error for {m.slug}: {e}")
     return paired
-
-
-def extract_token_id(market) -> Optional[str]:
-    for attr in ("outcomes", "token_ids", "clob_token_ids", "clobTokenIds"):
-        val = getattr(market, attr, None)
-        if val:
-            if isinstance(val, str):
-                try:
-                    val = json.loads(val)
-                except Exception:
-                    pass
-            if isinstance(val, (list, tuple)) and val:
-                return val[0]
-    return None
-
-
-def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS,
-                        interval: str = "1m") -> Optional[pd.DataFrame]:
-    loader = DataLoader()
-    end_time = datetime.now()
-    start_time = end_time - timedelta(hours=hours_back)
-    try:
-        frames = loader.fetch(
-            [token_id],
-            start_time.strftime("%Y-%m-%d"),
-            end_time.strftime("%Y-%m-%d"),
-            interval=interval,
-        )
-        if token_id in frames:
-            df = frames[token_id]
-            if df is not None and not df.empty:
-                return df
-    except Exception as e:
-        print(f"  ! history error: {e}")
-    return None
 
 
 # ============================================================================
@@ -575,6 +696,7 @@ class TennisBollingerScanner:
         self.last_score_change_ts: Dict[str, datetime] = {}
         self.last_point_time: Dict[str, datetime] = {}
         self.favorite_role: Dict[str, str] = {}
+        self.scan_count = 0
         self.live_client: Optional[LiveTennisClient] = None
 
     def initialize(self):
@@ -582,18 +704,26 @@ class TennisBollingerScanner:
         if not key:
             raise ValueError("LIVETENNIS_API_KEY not set.")
         self.live_client = LiveTennisClient(api_key=key)
-        print(f"[{datetime.now()}] Signal Engine initialized. "
+        print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only). "
               f"Cases: {sorted(ENABLED_CASES)}")
         print(f"[{datetime.now()}] ntfy topic: {NTFY_TOPIC} @ {NTFY_BASE_URL}")
+        cd_summary = ", ".join(
+            f"{k.split('_')[0]}={v}s" for k, v in CASE_SPECIFIC_COOLDOWN.items()
+        )
+        print(f"[{datetime.now()}] per-case cooldowns: {cd_summary}")
 
     def cooldown_key(self, slug: str, case_id: str) -> str:
         return f"{slug}::{case_id}"
 
-    def cooldown_ok(self, key: str) -> bool:
+    def cooldown_seconds_for(self, case_id: str) -> int:
+        return CASE_SPECIFIC_COOLDOWN.get(case_id, DEFAULT_ALERT_COOLDOWN_SECONDS)
+
+    def cooldown_ok(self, key: str, case_id: str) -> bool:
         st = self.alert_state.get(key)
         if st is None or st.last_alert_time is None:
             return True
-        return (datetime.now() - st.last_alert_time).total_seconds() >= ALERT_COOLDOWN_SECONDS
+        elapsed = (datetime.now() - st.last_alert_time).total_seconds()
+        return elapsed >= self.cooldown_seconds_for(case_id)
 
     def record_alert(self, key: str, kind: str):
         self.alert_state[key] = MarketAlert(
@@ -603,7 +733,7 @@ class TennisBollingerScanner:
 
     def fire(self, slug: str, sig: Signal, s: MarketSnapshot):
         key = self.cooldown_key(slug, sig.case_id)
-        if not self.cooldown_ok(key):
+        if not self.cooldown_ok(key, sig.case_id):
             return
 
         bar = "=" * 68
@@ -624,13 +754,16 @@ class TennisBollingerScanner:
         print(f"  ACTION:    {sig.trade_action}")
         if sig.details:
             print(f"  Details:   {sig.details}")
+        print(f"  Cooldown:  {self.cooldown_seconds_for(sig.case_id)}s")
         print(f"{bar}\n")
 
         title = f"{icon} {sig.case_id} — {s.tour}"
         body = format_ntfy_body(sig, s)
         tags = DIRECTION_TAG.get(sig.direction, "")
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
-        ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
+        #ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
+        
+        
         if not ok:
             print(f"  ! ntfy delivery failed for {sig.case_id}")
 
@@ -639,28 +772,82 @@ class TennisBollingerScanner:
     def build_snapshot(self, item) -> Optional[MarketSnapshot]:
         market = item["market"]
         match = item["match"]
+        slug = market.slug
 
         token_id = extract_token_id(market)
         if not token_id:
+            print(f"  [skip] {slug}: no token_id")
             return None
 
         df = fetch_price_history(token_id, hours_back=HISTORY_HOURS)
         if df is None or df.empty:
+            print(f"  [skip] {slug}: no usable history")
             return None
 
-        closes = df["close"] if "close" in df.columns else df.iloc[:, -1]
+        closes = df["close"]
         if len(closes) < BOLLINGER_PERIOD:
+            print(f"  [skip] {slug}: only {len(closes)} closes")
+            return None
+
+        if closes.tail(BOLLINGER_PERIOD).nunique() <= 1:
+            print(f"  [skip] {slug}: flat window")
             return None
 
         bands = calculate_bollinger_bands(closes)
+        if bands is not None and abs(bands["upper"] - bands["lower"]) < 1e-9:
+            print(f"  [skip] {slug}: bands collapsed")
+            return None
+
         touch = detect_band_touch(float(closes.iloc[-1]), bands)
 
-        score_line = getattr(match, "score_line", "") or ""
-        bp_flag = bool(getattr(match, "break_point", False))
-        server = getattr(match, "server", None)
-        receiver = getattr(match, "receiver", None)
+        if bands is not None and not pd.isna(bands["upper"]) and not pd.isna(bands["lower"]):
+            px = float(closes.iloc[-1])
+            up, lo, mid = bands["upper"], bands["lower"], bands["middle"]
+            dist_up_pct = (up - px) / px * 100.0
+            dist_lo_pct = (px - lo) / px * 100.0
+            dist_mid_pct = (px - mid) / mid * 100.0
+            band_width_pct = (up - lo) / mid * 100.0 if mid else 0.0
+            touch_tag = touch if touch else "-"
+            print(
+                f"  ~ {slug[:45]:<45}  "
+                f"px={px:.4f}  "
+                f"to_up={dist_up_pct:+.2f}%  "
+                f"to_lo={dist_lo_pct:+.2f}%  "
+                f"vs_mid={dist_mid_pct:+.2f}%  "
+                f"width={band_width_pct:.2f}%  "
+                f"touch={touch_tag}"
+            )
 
-        slug = market.slug
+        score_line = ""
+        bp_flag = False
+        server = None
+        receiver = None
+        try:
+            view = build_view(market, match)
+            if view is not None:
+                score_line = getattr(view, "score_line", "") or ""
+                bp_flag = bool(getattr(view, "break_point", False))
+
+                server_raw = getattr(view, "server", None)
+                outcomes = list(getattr(market, "outcomes", []) or [])
+
+                if isinstance(server_raw, int) and 0 <= server_raw < len(outcomes):
+                    server = outcomes[server_raw]
+                elif isinstance(server_raw, str):
+                    if server_raw.isdigit() and len(outcomes) > 0:
+                        idx = int(server_raw)
+                        if 0 <= idx < len(outcomes):
+                            server = outcomes[idx]
+                    else:
+                        server = server_raw
+                else:
+                    server = None
+
+                if server and len(outcomes) == 2:
+                    receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
+        except Exception as e:
+            print(f"  ! build_view error for {slug}: {e}")
+
         prev = self.last_score.get(slug)
         if prev != score_line:
             self.last_score[slug] = score_line
@@ -704,18 +891,24 @@ class TennisBollingerScanner:
         )
 
     def scan_once(self):
-        print(f"\n[{datetime.now()}] scan start")
+        self.scan_count += 1
+        print(f"\n[{datetime.now()}] scan start (cycle {self.scan_count})")
         markets = discover_tennis_markets_all()
         print(f"  discovered: {len(markets)}")
         if not markets:
             return
         paired = match_markets_to_live(markets, self.live_client)
-        print(f"  matched:    {len(paired)}")
+        print(f"  matched live: {len(paired)}")
 
         for item in paired:
             s = self.build_snapshot(item)
             if s is None:
                 continue
+
+            # Skip alert firing on cycle 1 — state memory isn't warmed up yet
+            if self.scan_count < 2:
+                continue
+
             signals = run_all_cases(s)
             for sig in signals:
                 self.fire(s.market_slug, sig, s)
@@ -735,8 +928,11 @@ class TennisBollingerScanner:
 
 
 # ============================================================================
-# FLASK WRAPPER — keeps Render's Web Service health check happy
+# FLASK WRAPPER
 # ============================================================================
+
+import threading
+from flask import Flask
 
 app = Flask(__name__)
 _scanner_thread: Optional[threading.Thread] = None
@@ -766,8 +962,6 @@ def health():
             "scanner_thread_alive": alive}, 200
 
 
-# Start the scanner as soon as the module is imported by gunicorn,
-# so it's already running before the first HTTP request arrives.
 _start_scanner_once()
 
 
