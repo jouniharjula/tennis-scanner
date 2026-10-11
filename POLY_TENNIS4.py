@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Polymarket ATP + WTA Tennis Real-Time Signal Engine
-Six-case alerts for LIVE matches only, with per-case cooldowns.
-Observe-only — no orders are placed.
+Six-case alerts for LIVE matches only, with per-case cooldowns and
+rate-limit-friendly API caching. Observe-only — no orders are placed.
 """
 
 import os
@@ -18,14 +18,11 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-import functools
-
 # Force print to flush after every call (Render buffers stdout otherwise)
 _print = print
 def print(*args, **kwargs):
     kwargs.setdefault("flush", True)
     _print(*args, **kwargs)
-
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -61,7 +58,16 @@ LIVETENNIS_API_KEY = os.environ.get(
     "twjp_fb6099bc479d519a016dc727e174ba60",
 )
 
-POLL_INTERVAL_SECONDS = 500
+# Fix A: poll every 15 minutes to stay under 100 req/day free tier.
+POLL_INTERVAL_SECONDS = 900
+
+# Fix C: cache live_matches() for 15 minutes (matches polling cadence).
+LIVE_MATCHES_CACHE_SECONDS = 900
+
+# build_view calls Live Tennis API once per market per cycle. Cache
+# per-match views for this long to avoid burning quota on unchanged data.
+VIEW_CACHE_SECONDS = 900
+
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2.0
 RESAMPLE_INTERVAL = "5min"
@@ -85,8 +91,9 @@ MIN_IQR = 0.001
 MARKOV_DIVERGENCE = 0.06
 
 # C4 low-vol FOLLOW requires the score to have moved within this many
-# seconds, otherwise the "meaningful" touch is treated as informational
-C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 3
+# seconds, otherwise the "meaningful" touch is treated as informational.
+# Widened for 15-min polling.
+C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 2
 
 # ----------------------------------------------------------------------------
 # PER-CASE COOLDOWNS (seconds)
@@ -94,11 +101,11 @@ C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 3
 DEFAULT_ALERT_COOLDOWN_SECONDS = 300
 CASE_SPECIFIC_COOLDOWN = {
     "C1_BREAKPOINT_CONTEXT":  600,
-    "C2_SCORE_DRIVEN":        600,
+    "C2_SCORE_DRIVEN":        900,   # was 600, widen for 15-min polling
     "C3_TIMEBREAK_NOISE":     900,
-    "C4_VOLATILITY_ADJUSTED": 180,
+    "C4_VOLATILITY_ADJUSTED": 900,   # was 180, widen so it doesn't refire per 15 min
     "C5_MARKOV_FAIRVALUE":    900,
-    "C6_FAVORITE_LONGSHOT":   600,
+    "C6_FAVORITE_LONGSHOT":   900,   # was 600
 }
 
 # ============================================================================
@@ -503,7 +510,6 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
     if iqr < MIN_IQR:
         return None
 
-    # High-vol regime: informational only, unchanged
     if iqr >= VOL_HIGH_IQR:
         return Signal(
             case_id="C4_VOLATILITY_ADJUSTED", direction="info",
@@ -514,7 +520,6 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
             details={"iqr": iqr, "regime": "high"},
         )
 
-    # Low-vol regime: require recent score activity for a FOLLOW signal
     if iqr <= VOL_LOW_IQR:
         recently_active = (
             s.last_score_change_ts is not None
@@ -635,29 +640,6 @@ def discover_tennis_markets_all() -> List:
     return out
 
 
-def match_markets_to_live(markets, live_client):
-    """
-    Match Polymarket markets to LIVE matches only. Fixtures (upcoming
-    matches) are excluded so pre-match markets don't pollute signals.
-    """
-    live = live_client.live_matches()
-    print(f"  [match] {len(live)} live matches from Live Tennis API")
-
-    paired = []
-    for m in markets:
-        try:
-            d = match_market(m, live)
-            if d and d.match:
-                paired.append({"market": m, "match": d.match,
-                               "confidence": d.confidence})
-                print(f"  [match] + {m.slug}")
-            else:
-                print(f"  [match] - {m.slug} (not live)")
-        except Exception as e:
-            print(f"  ! match error for {m.slug}: {e}")
-    return paired
-
-
 # ============================================================================
 # NTFY FORMATTER
 # ============================================================================
@@ -708,9 +690,13 @@ class TennisBollingerScanner:
         self.scan_count = 0
         self.live_client: Optional[LiveTennisClient] = None
 
-    def initialize(self):
+        # Caches for Live Tennis API quota protection
+        self._live_matches_cache: List = []
+        self._live_matches_ts: Optional[datetime] = None
+        self._view_cache: Dict[str, tuple] = {}  # slug -> (ts, view)
 
-        print(f"[{datetime.now()}] initialize() entered", flush=True)
+    def initialize(self):
+        print(f"[{datetime.now()}] initialize() entered")
         key = (LIVETENNIS_API_KEY or "").strip()
         if not key:
             raise ValueError("LIVETENNIS_API_KEY not set.")
@@ -718,10 +704,59 @@ class TennisBollingerScanner:
         print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only). "
               f"Cases: {sorted(ENABLED_CASES)}")
         print(f"[{datetime.now()}] ntfy topic: {NTFY_TOPIC} @ {NTFY_BASE_URL}")
+        print(f"[{datetime.now()}] poll interval: {POLL_INTERVAL_SECONDS}s  "
+              f"live cache: {LIVE_MATCHES_CACHE_SECONDS}s  "
+              f"view cache: {VIEW_CACHE_SECONDS}s")
         cd_summary = ", ".join(
             f"{k.split('_')[0]}={v}s" for k, v in CASE_SPECIFIC_COOLDOWN.items()
         )
         print(f"[{datetime.now()}] per-case cooldowns: {cd_summary}")
+
+    # ------------------------------------------------------------------
+    # Cached live_matches() — Fix C
+    # ------------------------------------------------------------------
+    def _get_live_matches(self) -> List:
+        now = datetime.now()
+        if (self._live_matches_ts is not None
+                and (now - self._live_matches_ts).total_seconds()
+                    < LIVE_MATCHES_CACHE_SECONDS):
+            age = (now - self._live_matches_ts).total_seconds()
+            print(f"  [match] using cached live list "
+                  f"({len(self._live_matches_cache)} matches, age {age:.0f}s)")
+            return self._live_matches_cache
+
+        try:
+            self._live_matches_cache = self.live_client.live_matches()
+        except Exception as e:
+            print(f"  ! live_matches() failed: {e}")
+            # Return stale cache if the call failed
+            return self._live_matches_cache
+
+        self._live_matches_ts = now
+        print(f"  [match] fetched {len(self._live_matches_cache)} live "
+              f"matches from Live Tennis API")
+        return self._live_matches_cache
+
+    # ------------------------------------------------------------------
+    # Cached build_view() per match — Fix C (view component)
+    # ------------------------------------------------------------------
+    def _get_view(self, market, match):
+        slug = getattr(market, "slug", None) or "unknown"
+        now = datetime.now()
+        cached = self._view_cache.get(slug)
+        if cached is not None:
+            ts, view = cached
+            if (now - ts).total_seconds() < VIEW_CACHE_SECONDS:
+                return view
+
+        try:
+            view = build_view(market, match)
+        except Exception as e:
+            print(f"  ! build_view error for {slug}: {e}")
+            view = None
+
+        self._view_cache[slug] = (now, view)
+        return view
 
     def cooldown_key(self, slug: str, case_id: str) -> str:
         return f"{slug}::{case_id}"
@@ -773,8 +808,6 @@ class TennisBollingerScanner:
         tags = DIRECTION_TAG.get(sig.direction, "")
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
         ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
-        
-        
         if not ok:
             print(f"  ! ntfy delivery failed for {sig.case_id}")
 
@@ -833,31 +866,30 @@ class TennisBollingerScanner:
         bp_flag = False
         server = None
         receiver = None
-        try:
-            view = build_view(market, match)
-            if view is not None:
-                score_line = getattr(view, "score_line", "") or ""
-                bp_flag = bool(getattr(view, "break_point", False))
 
-                server_raw = getattr(view, "server", None)
-                outcomes = list(getattr(market, "outcomes", []) or [])
+        # Use cached view — Fix C (view component)
+        view = self._get_view(market, match)
+        if view is not None:
+            score_line = getattr(view, "score_line", "") or ""
+            bp_flag = bool(getattr(view, "break_point", False))
 
-                if isinstance(server_raw, int) and 0 <= server_raw < len(outcomes):
-                    server = outcomes[server_raw]
-                elif isinstance(server_raw, str):
-                    if server_raw.isdigit() and len(outcomes) > 0:
-                        idx = int(server_raw)
-                        if 0 <= idx < len(outcomes):
-                            server = outcomes[idx]
-                    else:
-                        server = server_raw
+            server_raw = getattr(view, "server", None)
+            outcomes = list(getattr(market, "outcomes", []) or [])
+
+            if isinstance(server_raw, int) and 0 <= server_raw < len(outcomes):
+                server = outcomes[server_raw]
+            elif isinstance(server_raw, str):
+                if server_raw.isdigit() and len(outcomes) > 0:
+                    idx = int(server_raw)
+                    if 0 <= idx < len(outcomes):
+                        server = outcomes[idx]
                 else:
-                    server = None
+                    server = server_raw
+            else:
+                server = None
 
-                if server and len(outcomes) == 2:
-                    receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
-        except Exception as e:
-            print(f"  ! build_view error for {slug}: {e}")
+            if server and len(outcomes) == 2:
+                receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
 
         prev = self.last_score.get(slug)
         if prev != score_line:
@@ -901,6 +933,25 @@ class TennisBollingerScanner:
             markov_fair_prob=markov,
         )
 
+    def match_markets_to_live(self, markets) -> List:
+        """
+        Match markets to LIVE matches only, using cached live_matches().
+        """
+        live = self._get_live_matches()
+        paired = []
+        for m in markets:
+            try:
+                d = match_market(m, live)
+                if d and d.match:
+                    paired.append({"market": m, "match": d.match,
+                                   "confidence": d.confidence})
+                # Uncomment for verbose per-market output:
+                # else:
+                #     print(f"  [match] - {m.slug} (not live)")
+            except Exception as e:
+                print(f"  ! match error for {m.slug}: {e}")
+        return paired
+
     def scan_once(self):
         self.scan_count += 1
         print(f"\n[{datetime.now()}] scan start (cycle {self.scan_count})")
@@ -908,18 +959,15 @@ class TennisBollingerScanner:
         print(f"  discovered: {len(markets)}")
         if not markets:
             return
-        paired = match_markets_to_live(markets, self.live_client)
+        paired = self.match_markets_to_live(markets)
         print(f"  matched live: {len(paired)}")
 
         for item in paired:
             s = self.build_snapshot(item)
             if s is None:
                 continue
-
-            # Skip alert firing on cycle 1 — state memory isn't warmed up yet
             if self.scan_count < 2:
                 continue
-
             signals = run_all_cases(s)
             for sig in signals:
                 self.fire(s.market_slug, sig, s)
@@ -953,8 +1001,17 @@ def _start_scanner_once():
     global _scanner_thread
     if _scanner_thread is not None and _scanner_thread.is_alive():
         return
-    scanner = TennisBollingerScanner()
-    _scanner_thread = threading.Thread(target=scanner.run, daemon=True)
+
+    def _wrapped_run():
+        import sys, traceback
+        try:
+            scanner = TennisBollingerScanner()
+            scanner.run()
+        except Exception as e:
+            print(f"!! SCANNER THREAD CRASHED: {e}", file=sys.stderr)
+            traceback.print_exc()
+
+    _scanner_thread = threading.Thread(target=_wrapped_run, daemon=True)
     _scanner_thread.start()
     print(f"[{datetime.now()}] Scanner thread started")
 
@@ -965,15 +1022,14 @@ def root():
     return "Tennis scanner is running", 200
 
 
-
 @app.route("/scanner-status")
 def scanner_status():
-    import traceback
     if _scanner_thread is None:
         return {"scanner": "not started"}, 500
     if not _scanner_thread.is_alive():
         return {"scanner": "dead"}, 500
     return {"scanner": "alive"}, 200
+
 
 @app.route("/health")
 def health():
