@@ -761,7 +761,7 @@ class TennisBollingerScanner:
         body = format_ntfy_body(sig, s)
         tags = DIRECTION_TAG.get(sig.direction, "")
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
-        #ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
+        ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
         
         
         if not ok:
