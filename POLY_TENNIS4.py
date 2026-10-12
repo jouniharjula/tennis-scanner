@@ -13,7 +13,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -44,10 +44,18 @@ NTFY_USERNAME = os.environ.get("NTFY_USERNAME", "")
 NTFY_PASSWORD = os.environ.get("NTFY_PASSWORD", "")
 
 MAX_NTFY_LENGTH = 3900
-NTFY_MIN_GAP_SEC = 1.5
-NTFY_INTER_CHUNK_DELAY = 2.0
+
+# ntfy.sh free tier is aggressively rate-limited (~1 msg / 5s per topic,
+# often stricter on shared topics). Use a conservative gap and honor
+# Retry-After on 429s.
+NTFY_MIN_GAP_SEC = 6.0
+NTFY_INTER_CHUNK_DELAY = 6.0
 NTFY_MAX_ATTEMPTS = 3
-NTFY_CIRCUIT_BREAKER_THRESHOLD = 300.0
+NTFY_CIRCUIT_BREAKER_THRESHOLD = 120.0
+
+# Default backoff when the server does not send Retry-After.
+NTFY_BACKOFF_BASE_SEC = 8.0
+NTFY_BACKOFF_MAX_SEC = 60.0
 
 # ============================================================================
 # SCANNER CONFIGURATION
@@ -94,6 +102,11 @@ MARKOV_DIVERGENCE = 0.06
 # seconds, otherwise the "meaningful" touch is treated as informational.
 # Widened for 15-min polling.
 C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 2
+
+# Markets with price above/below these bounds are essentially resolved;
+# Bollinger band signals there are noise.
+PRICE_NEAR_CERTAIN = 0.97
+PRICE_NEAR_HOPELESS = 0.03
 
 # ----------------------------------------------------------------------------
 # PER-CASE COOLDOWNS (seconds)
@@ -230,9 +243,16 @@ def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS
 class NtfyClient:
     def __init__(self):
         self._last_send_ts = 0.0
+        # If the server tells us to wait, remember it globally so we do not
+        # hammer the endpoint from other senders either.
+        self._server_hold_until = 0.0
 
     def _wait_for_slot(self):
         now = time.monotonic()
+        # Honor any server-imposed hold first.
+        if now < self._server_hold_until:
+            time.sleep(self._server_hold_until - now)
+            now = time.monotonic()
         delta = now - self._last_send_ts
         if delta < NTFY_MIN_GAP_SEC:
             time.sleep(NTFY_MIN_GAP_SEC - delta)
@@ -261,8 +281,24 @@ class NtfyClient:
             remaining = remaining[cut:].lstrip("\n")
         return chunks
 
+    def _parse_retry_after(self, headers) -> Optional[float]:
+        """Return seconds to wait, or None if header absent/unparseable."""
+        if not headers:
+            return None
+        raw = headers.get("Retry-After")
+        if raw is None:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return None
+
     def _send_once(self, body: str, title: str, priority: str,
-                   tags: str) -> bool:
+                   tags: str) -> Tuple[bool, Optional[float], Optional[int]]:
+        """
+        Returns (ok, retry_after, status).
+        retry_after is populated only when the server signals 429/503.
+        """
         url = f"{NTFY_BASE_URL.rstrip('/')}/{NTFY_TOPIC}"
         data = body.encode("utf-8")
         headers = {
@@ -273,16 +309,28 @@ class NtfyClient:
         }
         headers.update(self._auth_header())
 
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                return 200 <= resp.status < 300
+                ok = 200 <= resp.status < 300
+                return ok, None, resp.status
         except urllib.error.HTTPError as e:
-            print(f"  ! ntfy HTTP {e.code}: {e.reason}")
-            return False
+            retry_after = self._parse_retry_after(getattr(e, "headers", None))
+            if e.code == 429:
+                print(f"  ! ntfy HTTP 429 (rate limited)"
+                      + (f", Retry-After={retry_after:.1f}s"
+                         if retry_after is not None else ""))
+            elif e.code == 503:
+                print(f"  ! ntfy HTTP 503 (service unavailable)"
+                      + (f", Retry-After={retry_after:.1f}s"
+                         if retry_after is not None else ""))
+            else:
+                print(f"  ! ntfy HTTP {e.code}: {e.reason}")
+            return False, retry_after, e.code
         except Exception as e:
             print(f"  ! ntfy error: {e}")
-            return False
+            return False, None, None
 
     def send(self, title: str, body: str, priority: str = "default",
              tags: str = "") -> bool:
@@ -295,15 +343,35 @@ class NtfyClient:
             self._wait_for_slot()
             start = time.monotonic()
             ok = False
+
             for attempt in range(1, NTFY_MAX_ATTEMPTS + 1):
-                ok = self._send_once(chunk, part_title, priority, tags)
+                ok, retry_after, status = self._send_once(
+                    chunk, part_title, priority, tags
+                )
                 if ok:
                     break
+
                 elapsed = time.monotonic() - start
                 if elapsed > NTFY_CIRCUIT_BREAKER_THRESHOLD:
-                    print(f"  ! ntfy circuit breaker tripped after {elapsed:.0f}s")
+                    print(f"  ! ntfy circuit breaker tripped after "
+                          f"{elapsed:.0f}s")
+                    self._last_send_ts = time.monotonic()
                     return False
-                time.sleep(1.5 * attempt)
+
+                if retry_after is not None and status in (429, 503):
+                    wait = min(retry_after, NTFY_BACKOFF_MAX_SEC)
+                    self._server_hold_until = time.monotonic() + wait
+                    print(f"  ~ ntfy backing off {wait:.1f}s per Retry-After")
+                    time.sleep(wait)
+                else:
+                    wait = min(
+                        NTFY_BACKOFF_BASE_SEC * attempt,
+                        NTFY_BACKOFF_MAX_SEC,
+                    )
+                    time.sleep(wait)
+
+                if attempt == NTFY_MAX_ATTEMPTS:
+                    break
 
             self._last_send_ts = time.monotonic()
             if not ok:
@@ -359,6 +427,14 @@ class Signal:
     trade_action: str
     confidence: str
     details: Dict[str, Any] = field(default_factory=dict)
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def market_is_near_resolved(price: float) -> bool:
+    return price >= PRICE_NEAR_CERTAIN or price <= PRICE_NEAR_HOPELESS
 
 
 # ============================================================================
@@ -610,6 +686,9 @@ CASE_DETECTORS = {
 
 
 def run_all_cases(s: MarketSnapshot) -> List[Signal]:
+    # Belt-and-suspenders: never fire on near-resolved markets.
+    if market_is_near_resolved(s.current_price):
+        return []
     out = []
     for cid, fn in CASE_DETECTORS.items():
         if cid not in ENABLED_CASES:
@@ -627,16 +706,26 @@ def run_all_cases(s: MarketSnapshot) -> List[Signal]:
 # DISCOVERY — LIVE MATCHES ONLY
 # ============================================================================
 
-def discover_tennis_markets_all() -> List:
-    out = []
+def discover_tennis_markets_all() -> List[Dict[str, Any]]:
+    """
+    Returns list of dicts: {"market": <market>, "tour": "ATP"|"WTA"}.
+    Tour is resolved once here so downstream code never has to guess.
+    """
+    out: List[Dict[str, Any]] = []
     with GammaClient() as gamma:
         all_markets = discover_tennis_markets(
             gamma, market_types={"moneyline"}, matches_only=True,
         )
         for m in all_markets:
             text = f"{m.question} {m.slug}".lower()
-            if any(t in text for t in TOUR_FILTERS):
-                out.append(m)
+            tour = None
+            if "atp" in text:
+                tour = "ATP"
+            elif "wta" in text:
+                tour = "WTA"
+            if tour is None:
+                continue
+            out.append({"market": m, "tour": tour})
     return out
 
 
@@ -809,7 +898,9 @@ class TennisBollingerScanner:
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
         ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
         if not ok:
-            print(f"  ! ntfy delivery failed for {sig.case_id}")
+            print(f"  ! ntfy delivery failed for {sig.case_id} — "
+                  f"cooldown NOT recorded, will retry next cycle")
+            return
 
         self.record_alert(key, sig.case_id)
 
@@ -842,10 +933,17 @@ class TennisBollingerScanner:
             print(f"  [skip] {slug}: bands collapsed")
             return None
 
-        touch = detect_band_touch(float(closes.iloc[-1]), bands)
+        last_price = float(closes.iloc[-1])
+        touch = detect_band_touch(last_price, bands)
+
+        # Skip markets too close to resolution for band signals to be
+        # meaningful.
+        if market_is_near_resolved(last_price):
+            print(f"  [skip] {slug}: near-resolved (px={last_price:.4f})")
+            return None
 
         if bands is not None and not pd.isna(bands["upper"]) and not pd.isna(bands["lower"]):
-            px = float(closes.iloc[-1])
+            px = last_price
             up, lo, mid = bands["upper"], bands["lower"], bands["middle"]
             dist_up_pct = (up - px) / px * 100.0
             dist_lo_pct = (px - lo) / px * 100.0
@@ -891,11 +989,19 @@ class TennisBollingerScanner:
             if server and len(outcomes) == 2:
                 receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
 
+        # Score-change tracking: only timestamp genuine transitions.
         prev = self.last_score.get(slug)
-        if prev != score_line:
+        if prev is None:
+            # First observation for this market — record baseline but do NOT
+            # mark it as a "change". Otherwise C2 fires HIGH on stale data.
+            self.last_score[slug] = score_line
+            self.last_point_time[slug] = datetime.now()
+        elif prev != score_line:
+            # Genuine transition between two observed states.
             self.last_score[slug] = score_line
             self.last_score_change_ts[slug] = datetime.now()
             self.last_point_time[slug] = datetime.now()
+        # If prev == score_line, nothing to do.
 
         role = self.favorite_role.get(slug, "unknown")
         if role == "unknown":
@@ -915,11 +1021,10 @@ class TennisBollingerScanner:
         return MarketSnapshot(
             market_slug=slug,
             question=market.question,
-            tour="ATP" if "atp" in market.question.lower()
-            else ("WTA" if "wta" in market.question.lower() else "UNKNOWN"),
+            tour=item.get("tour", "UNKNOWN"),
             outcomes=list(getattr(market, "outcomes", []) or []),
             token_id=token_id,
-            current_price=float(closes.iloc[-1]),
+            current_price=last_price,
             bands=bands,
             touch=touch,
             score_line=score_line,
@@ -933,21 +1038,25 @@ class TennisBollingerScanner:
             markov_fair_prob=markov,
         )
 
-    def match_markets_to_live(self, markets) -> List:
+    def match_markets_to_live(self, discovered) -> List:
         """
         Match markets to LIVE matches only, using cached live_matches().
+        `discovered` is a list of {"market": ..., "tour": ...} dicts.
         """
         live = self._get_live_matches()
         paired = []
-        for m in markets:
+        for entry in discovered:
+            m = entry["market"]
+            tour = entry["tour"]
             try:
                 d = match_market(m, live)
                 if d and d.match:
-                    paired.append({"market": m, "match": d.match,
-                                   "confidence": d.confidence})
-                # Uncomment for verbose per-market output:
-                # else:
-                #     print(f"  [match] - {m.slug} (not live)")
+                    paired.append({
+                        "market": m,
+                        "match": d.match,
+                        "confidence": d.confidence,
+                        "tour": tour,
+                    })
             except Exception as e:
                 print(f"  ! match error for {m.slug}: {e}")
         return paired
@@ -955,11 +1064,11 @@ class TennisBollingerScanner:
     def scan_once(self):
         self.scan_count += 1
         print(f"\n[{datetime.now()}] scan start (cycle {self.scan_count})")
-        markets = discover_tennis_markets_all()
-        print(f"  discovered: {len(markets)}")
-        if not markets:
+        discovered = discover_tennis_markets_all()
+        print(f"  discovered: {len(discovered)}")
+        if not discovered:
             return
-        paired = self.match_markets_to_live(markets)
+        paired = self.match_markets_to_live(discovered)
         print(f"  matched live: {len(paired)}")
 
         for item in paired:
