@@ -3,6 +3,9 @@
 Polymarket ATP + WTA Tennis Real-Time Signal Engine
 Six-case alerts for LIVE matches only, with per-case cooldowns and
 rate-limit-friendly API caching. Observe-only — no orders are placed.
+
+Alerts are relayed through PythonAnywhere (see PA_RELAY_URL) to work around
+ntfy.sh's IP-based rate limiting on Render's shared egress.
 """
 
 import os
@@ -35,7 +38,17 @@ from polymarket_tennis import (
 )
 
 # ============================================================================
-# NTFY CONFIGURATION
+# RELAY CONFIGURATION (PythonAnywhere -> ntfy.sh)
+# ============================================================================
+
+# Render posts alerts here; PythonAnywhere forwards them to ntfy.sh.
+PA_RELAY_URL = os.environ.get(
+    "PA_RELAY_URL",
+    "https://jharjula.pythonanywhere.com/relay",
+)
+
+# ============================================================================
+# NTFY CONFIGURATION (used only by the PA relay, kept for reference)
 # ============================================================================
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "trademap-jl-7x9k2")
@@ -44,16 +57,10 @@ NTFY_USERNAME = os.environ.get("NTFY_USERNAME", "")
 NTFY_PASSWORD = os.environ.get("NTFY_PASSWORD", "")
 
 MAX_NTFY_LENGTH = 3900
-
-# ntfy.sh free tier is aggressively rate-limited (~1 msg / 5s per topic,
-# often stricter on shared topics). Use a conservative gap and honor
-# Retry-After on 429s.
 NTFY_MIN_GAP_SEC = 6.0
 NTFY_INTER_CHUNK_DELAY = 6.0
 NTFY_MAX_ATTEMPTS = 3
 NTFY_CIRCUIT_BREAKER_THRESHOLD = 120.0
-
-# Default backoff when the server does not send Retry-After.
 NTFY_BACKOFF_BASE_SEC = 8.0
 NTFY_BACKOFF_MAX_SEC = 60.0
 
@@ -66,14 +73,8 @@ LIVETENNIS_API_KEY = os.environ.get(
     "twjp_fb6099bc479d519a016dc727e174ba60",
 )
 
-# Fix A: poll every 15 minutes to stay under 100 req/day free tier.
 POLL_INTERVAL_SECONDS = 900
-
-# Fix C: cache live_matches() for 15 minutes (matches polling cadence).
 LIVE_MATCHES_CACHE_SECONDS = 900
-
-# build_view calls Live Tennis API once per market per cycle. Cache
-# per-match views for this long to avoid burning quota on unchanged data.
 VIEW_CACHE_SECONDS = 900
 
 BOLLINGER_PERIOD = 20
@@ -98,27 +99,19 @@ VOL_LOW_IQR = 0.015
 MIN_IQR = 0.001
 MARKOV_DIVERGENCE = 0.06
 
-# C4 low-vol FOLLOW requires the score to have moved within this many
-# seconds, otherwise the "meaningful" touch is treated as informational.
-# Widened for 15-min polling.
 C4_RECENT_ACTIVITY_WINDOW_S = POLL_INTERVAL_SECONDS * 2
 
-# Markets with price above/below these bounds are essentially resolved;
-# Bollinger band signals there are noise.
 PRICE_NEAR_CERTAIN = 0.97
 PRICE_NEAR_HOPELESS = 0.03
 
-# ----------------------------------------------------------------------------
-# PER-CASE COOLDOWNS (seconds)
-# ----------------------------------------------------------------------------
 DEFAULT_ALERT_COOLDOWN_SECONDS = 300
 CASE_SPECIFIC_COOLDOWN = {
     "C1_BREAKPOINT_CONTEXT":  600,
-    "C2_SCORE_DRIVEN":        900,   # was 600, widen for 15-min polling
+    "C2_SCORE_DRIVEN":        900,
     "C3_TIMEBREAK_NOISE":     900,
-    "C4_VOLATILITY_ADJUSTED": 900,   # was 180, widen so it doesn't refire per 15 min
+    "C4_VOLATILITY_ADJUSTED": 900,
     "C5_MARKOV_FAIRVALUE":    900,
-    "C6_FAVORITE_LONGSHOT":   900,   # was 600
+    "C6_FAVORITE_LONGSHOT":   900,
 }
 
 # ============================================================================
@@ -237,153 +230,64 @@ def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS
 
 
 # ============================================================================
-# NTFY CLIENT
+# RELAY CLIENT (posts to PythonAnywhere)
 # ============================================================================
 
-class NtfyClient:
-    def __init__(self):
+class RelayClient:
+    """
+    Sends alerts to the PythonAnywhere relay endpoint, which then forwards
+    them to ntfy.sh from PythonAnywhere's clean egress IP.
+    """
+    def __init__(self, relay_url: str):
+        self.relay_url = relay_url
         self._last_send_ts = 0.0
-        # If the server tells us to wait, remember it globally so we do not
-        # hammer the endpoint from other senders either.
-        self._server_hold_until = 0.0
+        self._min_gap_sec = 2.0
 
     def _wait_for_slot(self):
-        now = time.monotonic()
-        # Honor any server-imposed hold first.
-        if now < self._server_hold_until:
-            time.sleep(self._server_hold_until - now)
-            now = time.monotonic()
-        delta = now - self._last_send_ts
-        if delta < NTFY_MIN_GAP_SEC:
-            time.sleep(NTFY_MIN_GAP_SEC - delta)
-
-    def _auth_header(self) -> Dict[str, str]:
-        if NTFY_USERNAME and NTFY_PASSWORD:
-            import base64
-            token = base64.b64encode(
-                f"{NTFY_USERNAME}:{NTFY_PASSWORD}".encode()
-            ).decode()
-            return {"Authorization": f"Basic {token}"}
-        return {}
-
-    def _chunk(self, text: str) -> List[str]:
-        if len(text) <= MAX_NTFY_LENGTH:
-            return [text]
-        chunks = []
-        remaining = text
-        while remaining:
-            cut = min(MAX_NTFY_LENGTH, len(remaining))
-            if cut < len(remaining):
-                nl = remaining.rfind("\n", 0, cut)
-                if nl > MAX_NTFY_LENGTH * 0.5:
-                    cut = nl
-            chunks.append(remaining[:cut])
-            remaining = remaining[cut:].lstrip("\n")
-        return chunks
-
-    def _parse_retry_after(self, headers) -> Optional[float]:
-        """Return seconds to wait, or None if header absent/unparseable."""
-        if not headers:
-            return None
-        raw = headers.get("Retry-After")
-        if raw is None:
-            return None
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return None
-
-    def _send_once(self, body: str, title: str, priority: str,
-                   tags: str) -> Tuple[bool, Optional[float], Optional[int]]:
-        """
-        Returns (ok, retry_after, status).
-        retry_after is populated only when the server signals 429/503.
-        """
-        url = f"{NTFY_BASE_URL.rstrip('/')}/{NTFY_TOPIC}"
-        data = body.encode("utf-8")
-        headers = {
-            "Title": title.encode("utf-8").decode("latin-1", "ignore"),
-            "Priority": priority,
-            "Tags": tags,
-            "Content-Type": "text/plain; charset=utf-8",
-        }
-        headers.update(self._auth_header())
-
-        req = urllib.request.Request(url, data=data, headers=headers,
-                                     method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                ok = 200 <= resp.status < 300
-                return ok, None, resp.status
-        except urllib.error.HTTPError as e:
-            retry_after = self._parse_retry_after(getattr(e, "headers", None))
-            if e.code == 429:
-                print(f"  ! ntfy HTTP 429 (rate limited)"
-                      + (f", Retry-After={retry_after:.1f}s"
-                         if retry_after is not None else ""))
-            elif e.code == 503:
-                print(f"  ! ntfy HTTP 503 (service unavailable)"
-                      + (f", Retry-After={retry_after:.1f}s"
-                         if retry_after is not None else ""))
-            else:
-                print(f"  ! ntfy HTTP {e.code}: {e.reason}")
-            return False, retry_after, e.code
-        except Exception as e:
-            print(f"  ! ntfy error: {e}")
-            return False, None, None
+        delta = time.monotonic() - self._last_send_ts
+        if delta < self._min_gap_sec:
+            time.sleep(self._min_gap_sec - delta)
 
     def send(self, title: str, body: str, priority: str = "default",
              tags: str = "") -> bool:
-        chunks = self._chunk(body)
-        total = len(chunks)
-        all_ok = True
+        self._wait_for_slot()
 
-        for i, chunk in enumerate(chunks, 1):
-            part_title = title if total == 1 else f"{title} ({i}/{total})"
-            self._wait_for_slot()
-            start = time.monotonic()
-            ok = False
+        payload = json.dumps({
+            "title": title,
+            "body": body,
+            "priority": priority,
+            "tags": tags,
+        }).encode("utf-8")
 
-            for attempt in range(1, NTFY_MAX_ATTEMPTS + 1):
-                ok, retry_after, status = self._send_once(
-                    chunk, part_title, priority, tags
-                )
-                if ok:
-                    break
+        req = urllib.request.Request(
+            self.relay_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "tennis-scanner/1.0",
+            },
+            method="POST",
+        )
 
-                elapsed = time.monotonic() - start
-                if elapsed > NTFY_CIRCUIT_BREAKER_THRESHOLD:
-                    print(f"  ! ntfy circuit breaker tripped after "
-                          f"{elapsed:.0f}s")
-                    self._last_send_ts = time.monotonic()
-                    return False
-
-                if retry_after is not None and status in (429, 503):
-                    wait = min(retry_after, NTFY_BACKOFF_MAX_SEC)
-                    self._server_hold_until = time.monotonic() + wait
-                    print(f"  ~ ntfy backing off {wait:.1f}s per Retry-After")
-                    time.sleep(wait)
-                else:
-                    wait = min(
-                        NTFY_BACKOFF_BASE_SEC * attempt,
-                        NTFY_BACKOFF_MAX_SEC,
-                    )
-                    time.sleep(wait)
-
-                if attempt == NTFY_MAX_ATTEMPTS:
-                    break
-
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status = resp.status
+                preview = resp.read(200).decode("utf-8", "ignore")
+                print(f"  [relay] PA responded {status}: {preview[:120]}")
+                self._last_send_ts = time.monotonic()
+                return 200 <= status < 300
+        except urllib.error.HTTPError as e:
+            preview = e.read(300).decode("utf-8", "ignore")
+            print(f"  [relay] PA HTTP {e.code}: {e.reason} — {preview}")
             self._last_send_ts = time.monotonic()
-            if not ok:
-                all_ok = False
-
-            if i < total:
-                time.sleep(NTFY_INTER_CHUNK_DELAY)
-
-        return all_ok
+            return False
+        except Exception as e:
+            print(f"  [relay] PA error: {e}")
+            self._last_send_ts = time.monotonic()
+            return False
 
 
-NTFY = NtfyClient()
+RELAY = RelayClient(PA_RELAY_URL)
 
 
 # ============================================================================
@@ -686,7 +590,6 @@ CASE_DETECTORS = {
 
 
 def run_all_cases(s: MarketSnapshot) -> List[Signal]:
-    # Belt-and-suspenders: never fire on near-resolved markets.
     if market_is_near_resolved(s.current_price):
         return []
     out = []
@@ -709,7 +612,6 @@ def run_all_cases(s: MarketSnapshot) -> List[Signal]:
 def discover_tennis_markets_all() -> List[Dict[str, Any]]:
     """
     Returns list of dicts: {"market": <market>, "tour": "ATP"|"WTA"}.
-    Tour is resolved once here so downstream code never has to guess.
     """
     out: List[Dict[str, Any]] = []
     with GammaClient() as gamma:
@@ -779,10 +681,9 @@ class TennisBollingerScanner:
         self.scan_count = 0
         self.live_client: Optional[LiveTennisClient] = None
 
-        # Caches for Live Tennis API quota protection
         self._live_matches_cache: List = []
         self._live_matches_ts: Optional[datetime] = None
-        self._view_cache: Dict[str, tuple] = {}  # slug -> (ts, view)
+        self._view_cache: Dict[str, tuple] = {}
 
     def initialize(self):
         print(f"[{datetime.now()}] initialize() entered")
@@ -792,7 +693,7 @@ class TennisBollingerScanner:
         self.live_client = LiveTennisClient(api_key=key)
         print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only). "
               f"Cases: {sorted(ENABLED_CASES)}")
-        print(f"[{datetime.now()}] ntfy topic: {NTFY_TOPIC} @ {NTFY_BASE_URL}")
+        print(f"[{datetime.now()}] relay URL: {PA_RELAY_URL}")
         print(f"[{datetime.now()}] poll interval: {POLL_INTERVAL_SECONDS}s  "
               f"live cache: {LIVE_MATCHES_CACHE_SECONDS}s  "
               f"view cache: {VIEW_CACHE_SECONDS}s")
@@ -801,9 +702,6 @@ class TennisBollingerScanner:
         )
         print(f"[{datetime.now()}] per-case cooldowns: {cd_summary}")
 
-    # ------------------------------------------------------------------
-    # Cached live_matches() — Fix C
-    # ------------------------------------------------------------------
     def _get_live_matches(self) -> List:
         now = datetime.now()
         if (self._live_matches_ts is not None
@@ -818,7 +716,6 @@ class TennisBollingerScanner:
             self._live_matches_cache = self.live_client.live_matches()
         except Exception as e:
             print(f"  ! live_matches() failed: {e}")
-            # Return stale cache if the call failed
             return self._live_matches_cache
 
         self._live_matches_ts = now
@@ -826,9 +723,6 @@ class TennisBollingerScanner:
               f"matches from Live Tennis API")
         return self._live_matches_cache
 
-    # ------------------------------------------------------------------
-    # Cached build_view() per match — Fix C (view component)
-    # ------------------------------------------------------------------
     def _get_view(self, market, match):
         slug = getattr(market, "slug", None) or "unknown"
         now = datetime.now()
@@ -896,9 +790,11 @@ class TennisBollingerScanner:
         body = format_ntfy_body(sig, s)
         tags = DIRECTION_TAG.get(sig.direction, "")
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
-        ok = NTFY.send(title=title, body=body, priority=priority, tags=tags)
+
+        ok = RELAY.send(title=title, body=body, priority=priority, tags=tags)
+
         if not ok:
-            print(f"  ! ntfy delivery failed for {sig.case_id} — "
+            print(f"  ! relay delivery failed for {sig.case_id} — "
                   f"cooldown NOT recorded, will retry next cycle")
             return
 
@@ -936,8 +832,6 @@ class TennisBollingerScanner:
         last_price = float(closes.iloc[-1])
         touch = detect_band_touch(last_price, bands)
 
-        # Skip markets too close to resolution for band signals to be
-        # meaningful.
         if market_is_near_resolved(last_price):
             print(f"  [skip] {slug}: near-resolved (px={last_price:.4f})")
             return None
@@ -965,7 +859,6 @@ class TennisBollingerScanner:
         server = None
         receiver = None
 
-        # Use cached view — Fix C (view component)
         view = self._get_view(market, match)
         if view is not None:
             score_line = getattr(view, "score_line", "") or ""
@@ -989,19 +882,14 @@ class TennisBollingerScanner:
             if server and len(outcomes) == 2:
                 receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
 
-        # Score-change tracking: only timestamp genuine transitions.
         prev = self.last_score.get(slug)
         if prev is None:
-            # First observation for this market — record baseline but do NOT
-            # mark it as a "change". Otherwise C2 fires HIGH on stale data.
             self.last_score[slug] = score_line
             self.last_point_time[slug] = datetime.now()
         elif prev != score_line:
-            # Genuine transition between two observed states.
             self.last_score[slug] = score_line
             self.last_score_change_ts[slug] = datetime.now()
             self.last_point_time[slug] = datetime.now()
-        # If prev == score_line, nothing to do.
 
         role = self.favorite_role.get(slug, "unknown")
         if role == "unknown":
@@ -1039,10 +927,6 @@ class TennisBollingerScanner:
         )
 
     def match_markets_to_live(self, discovered) -> List:
-        """
-        Match markets to LIVE matches only, using cached live_matches().
-        `discovered` is a list of {"market": ..., "tour": ...} dicts.
-        """
         live = self._get_live_matches()
         paired = []
         for entry in discovered:
@@ -1096,7 +980,7 @@ class TennisBollingerScanner:
 
 
 # ============================================================================
-# FLASK WRAPPER
+# FLASK WRAPPER (Render health/status endpoints)
 # ============================================================================
 
 import threading
