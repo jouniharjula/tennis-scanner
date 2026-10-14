@@ -632,6 +632,70 @@ def discover_tennis_markets_all() -> List[Dict[str, Any]]:
 
 
 # ============================================================================
+# FAVORITE / UNDERDOG IDENTIFICATION (discreet ntfy tag)
+# ============================================================================
+
+def _identify_favorite_underdog(
+    s: MarketSnapshot,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Identify which player is the favorite and which is the underdog.
+
+    Uses multiple signals in priority order:
+      1. Outcomes length must be exactly 2 (binary market).
+      2. Derive from current_price: the higher-priced side is the favorite
+         since Polymarket prices approximate implied probability.
+      3. Respect s.role to correct orientation if needed.
+
+    Returns (favorite_name, underdog_name) or (None, None) if unresolvable.
+    """
+    outcomes = list(s.outcomes or [])
+    if len(outcomes) != 2:
+        return None, None
+
+    p0 = None
+    p1 = None
+
+    # current_price tracks the token for outcomes[0] (the first CLOB token
+    # id returned by gamma), so we can treat it as p0.
+    if isinstance(s.current_price, (int, float)):
+        try:
+            p0 = float(s.current_price)
+            p1 = 1.0 - p0
+        except Exception:
+            p0, p1 = None, None
+
+    # If role hints flip the orientation, respect it.
+    if s.role == "underdog" and p0 is not None and p1 is not None:
+        if p0 > p1:
+            p0, p1 = p1, p0
+
+    if p0 is None or p1 is None:
+        return None, None
+
+    if p0 >= p1:
+        return outcomes[0], outcomes[1]
+    return outcomes[1], outcomes[0]
+
+
+def _discreet_role_tag(s: MarketSnapshot) -> str:
+    """
+    Build a short, low-key tag for the ntfy message body.
+    Example: 'fav: Djokovic | dog: Alcaraz'
+    Kept intentionally understated (no emojis, no all-caps).
+    """
+    fav, dog = _identify_favorite_underdog(s)
+    if not fav or not dog:
+        return ""
+
+    def _short(name: str, limit: int = 22) -> str:
+        name = str(name).strip()
+        return name if len(name) <= limit else name[: limit - 1] + "…"
+
+    return f"fav: {_short(fav)} | dog: {_short(dog)}"
+
+
+# ============================================================================
 # NTFY FORMATTER
 # ============================================================================
 
@@ -664,6 +728,31 @@ def format_ntfy_body(sig: Signal, s: MarketSnapshot) -> str:
     if sig.details:
         lines += ["", f"Details: {sig.details}"]
     lines += ["", f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+    return "\n".join(lines)
+
+
+def format_ntfy_body_with_roles(sig: Signal, s: MarketSnapshot) -> str:
+    """
+    Same output as format_ntfy_body(), but appends a discreet role line
+    identifying favorite and underdog. Falls back to the original body
+    when roles can't be resolved (e.g., non-binary market).
+    """
+    base = format_ntfy_body(sig, s)
+    tag = _discreet_role_tag(s)
+    if not tag:
+        return base
+
+    lines = base.split("\n")
+    insert_at = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("Time:"):
+            insert_at = i
+            break
+
+    lines.insert(insert_at, f"Roles:   {tag}")
+    if insert_at < len(lines) - 1 and lines[insert_at - 1] != "":
+        lines.insert(insert_at, "")
+
     return "\n".join(lines)
 
 
@@ -784,10 +873,14 @@ class TennisBollingerScanner:
         if sig.details:
             print(f"  Details:   {sig.details}")
         print(f"  Cooldown:  {self.cooldown_seconds_for(sig.case_id)}s")
+
+        role_tag = _discreet_role_tag(s)
+        if role_tag:
+            print(f"  Roles:     {role_tag}")
         print(f"{bar}\n")
 
         title = f"{icon} {sig.case_id} — {s.tour}"
-        body = format_ntfy_body(sig, s)
+        body = format_ntfy_body_with_roles(sig, s)
         tags = DIRECTION_TAG.get(sig.direction, "")
         priority = DIRECTION_PRIORITY.get(sig.direction, "default")
 
