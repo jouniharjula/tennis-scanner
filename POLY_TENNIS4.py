@@ -4,8 +4,10 @@ Polymarket ATP + WTA Tennis Real-Time Signal Engine
 Six-case alerts for LIVE matches only, with per-case cooldowns and
 rate-limit-friendly API caching. Observe-only — no orders are placed.
 
-Alerts are relayed through PythonAnywhere (see PA_RELAY_URL) to work around
-ntfy.sh's IP-based rate limiting on Render's shared egress.
+This version:
+- Skips all doubles (both Polymarket + LiveTennis)
+- Better LiveTennis debug printing (shows real player names)
+- Improved C1–C6 strategies
 """
 
 import os
@@ -21,7 +23,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-# Force print to flush after every call (Render buffers stdout otherwise)
+# Force print to flush after every call
 _print = print
 def print(*args, **kwargs):
     kwargs.setdefault("flush", True)
@@ -38,7 +40,7 @@ from polymarket_tennis import (
 )
 
 # ============================================================================
-# RELAY CONFIGURATION (PythonAnywhere -> ntfy.sh)
+# RELAY CONFIGURATION
 # ============================================================================
 
 PA_RELAY_URL = os.environ.get(
@@ -47,7 +49,7 @@ PA_RELAY_URL = os.environ.get(
 )
 
 # ============================================================================
-# NTFY CONFIGURATION (used only by the PA relay, kept for reference)
+# NTFY CONFIGURATION (reference only)
 # ============================================================================
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "trademap-jl-7x9k2")
@@ -73,15 +75,13 @@ LIVETENNIS_API_KEY = os.environ.get(
 )
 
 POLL_INTERVAL_SECONDS = 900
-LIVE_MATCHES_CACHE_SECONDS = 900
+LIVE_MATCHES_CACHE_SECONDS = 180          # 3 minutes
 VIEW_CACHE_SECONDS = 900
 
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2.0
 RESAMPLE_INTERVAL = "5min"
 HISTORY_HOURS = 3
-
-TOUR_FILTERS = ("atp", "wta")
 
 ENABLED_CASES = {
     "C1_BREAKPOINT_CONTEXT",
@@ -229,7 +229,7 @@ def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS
 
 
 # ============================================================================
-# RELAY CLIENT (posts to PythonAnywhere)
+# RELAY CLIENT
 # ============================================================================
 
 class RelayClient:
@@ -389,11 +389,10 @@ def estimate_markov_fair_prob(score_line: str, server: Optional[str],
 
 
 # ============================================================================
-# SHARED HELPERS FOR IMPROVED CASES
+# SHARED HELPERS
 # ============================================================================
 
 def _get_current_role(s: MarketSnapshot) -> str:
-    """Dynamically determine favorite / underdog."""
     if len(s.outcomes) != 2:
         return s.role if s.role != "unknown" else "unknown"
 
@@ -418,7 +417,6 @@ def _get_current_role(s: MarketSnapshot) -> str:
 
 
 def _touch_distance(s: MarketSnapshot) -> Optional[float]:
-    """How far outside the band the price is (positive = outside)."""
     if s.bands is None or s.touch is None:
         return None
     if s.touch == "upper":
@@ -443,11 +441,10 @@ def _seconds_since_score(s: MarketSnapshot) -> Optional[float]:
 
 
 # ============================================================================
-# SIX CASE DETECTORS (IMPROVED)
+# SIX CASE DETECTORS
 # ============================================================================
 
 def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
-    """Improved C1: Role-aware + penetration + Markov confirmation."""
     if not s.break_point_flag or s.touch is None:
         return None
 
@@ -455,7 +452,6 @@ def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
     if dist is None or dist < 0.006:
         return None
 
-    # Ignore pure changeover noise
     if s.last_point_time is not None:
         gap = (datetime.now() - s.last_point_time).total_seconds()
         if gap >= CHANGEOVER_THRESHOLD_S:
@@ -472,7 +468,6 @@ def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
         "touch_distance": round(dist, 4),
     }
 
-    # Markov confirmation boosts confidence
     if s.markov_fair_prob is not None:
         div = abs(s.current_price - s.markov_fair_prob)
         details["markov_div"] = round(div, 4)
@@ -483,20 +478,15 @@ def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
         confidence = "MEDIUM"
 
     if s.touch == "upper":
-        # Server odds spiked while facing break point
         title = "BREAK POINT + UPPER TOUCH"
         reason = (
             f"Server ({s.server}) odds spiked to upper band while facing break point. "
             "Market overrating the save."
         )
-        trade_action = (
-            f"FADE the server ({s.server}). Consider buying {s.receiver}."
-        )
-        # Stronger when the server is the favorite
+        trade_action = f"FADE the server ({s.server}). Consider buying {s.receiver}."
         if role == "favorite":
             confidence = "HIGH" if confidence != "LOW" else confidence
     else:
-        # Receiver odds dropped while holding break point
         title = "BREAK POINT + LOWER TOUCH"
         reason = (
             f"Receiver ({s.receiver}) odds dropped to lower band while holding break point. "
@@ -516,7 +506,6 @@ def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
 
 
 def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
-    """Improved C2: Tighter window, direction awareness, volatility filter."""
     if s.touch is None:
         return None
 
@@ -538,29 +527,18 @@ def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
             details={"touch_distance": round(dist, 4)},
         )
 
-    # Tighter recent window for Follow
-    recent_window = POLL_INTERVAL_SECONDS * 0.85   # \~12.75 min
+    recent_window = POLL_INTERVAL_SECONDS * 0.85
 
     if seconds <= recent_window:
-        # Potential Follow
-        if high_vol:
-            conf = "MEDIUM"
-            extra = " (high-vol regime — reduced confidence)"
-        else:
-            conf = "HIGH"
-            extra = ""
+        conf = "MEDIUM" if high_vol else "HIGH"
+        extra = " (high-vol regime — reduced confidence)" if high_vol else ""
 
         return Signal(
             case_id="C2_SCORE_DRIVEN",
             direction="follow",
             title=f"{s.touch.upper()} TOUCH — REAL SCORE MOVE",
-            reason=(
-                f"Score changed {seconds:.0f}s ago. Event-driven repricing"
-                f"{extra}."
-            ),
-            trade_action=(
-                f"FOLLOW the move. Buy the player whose odds touched the {s.touch} band."
-            ),
+            reason=f"Score changed {seconds:.0f}s ago. Event-driven repricing{extra}.",
+            trade_action=f"FOLLOW the move. Buy the player whose odds touched the {s.touch} band.",
             confidence=conf,
             details={
                 "seconds_since_score_change": round(seconds, 1),
@@ -569,7 +547,6 @@ def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
             },
         )
 
-    # Stale touch → Fade
     return Signal(
         case_id="C2_SCORE_DRIVEN",
         direction="fade",
@@ -585,7 +562,6 @@ def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
 
 
 def case_3_timebreak(s: MarketSnapshot) -> Optional[Signal]:
-    """C3: Changeover / long-gap noise filter (kept defensive)."""
     if s.touch is None or s.last_point_time is None:
         return None
 
@@ -604,7 +580,6 @@ def case_3_timebreak(s: MarketSnapshot) -> Optional[Signal]:
 
 
 def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
-    """Improved C4: Clearer regime handling."""
     if s.touch is None or len(s.recent_prices) < BOLLINGER_PERIOD:
         return None
 
@@ -620,7 +595,6 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
     if dist is not None:
         details["touch_distance"] = round(dist, 4)
 
-    # High volatility → ignore
     if iqr >= VOL_HIGH_IQR:
         return Signal(
             case_id="C4_VOLATILITY_ADJUSTED",
@@ -632,22 +606,16 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
             details={**details, "regime": "high"},
         )
 
-    # Low volatility
     if iqr <= VOL_LOW_IQR:
         seconds = _seconds_since_score(s)
-        recently_active = (
-            seconds is not None and seconds <= C4_RECENT_ACTIVITY_WINDOW_S
-        )
+        recently_active = seconds is not None and seconds <= C4_RECENT_ACTIVITY_WINDOW_S
 
         if not recently_active:
             return Signal(
                 case_id="C4_VOLATILITY_ADJUSTED",
                 direction="info",
                 title=f"{s.touch.upper()} TOUCH IN LOW-VOL (STALE)",
-                reason=(
-                    f"IQR={iqr:.4f} low but no recent score activity. "
-                    "Quiet market — touch is likely noise."
-                ),
+                reason=f"IQR={iqr:.4f} low but no recent score activity. Quiet market — touch is likely noise.",
                 trade_action="IGNORE — no score context to justify FOLLOW.",
                 confidence="LOW",
                 details={**details, "regime": "low-stale"},
@@ -663,16 +631,13 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
             details={**details, "regime": "low-active"},
         )
 
-    # Medium volatility — neutral, no signal
     return None
 
 
 def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
-    """Improved C5: Requires recent activity + penetration + better confidence."""
     if s.markov_fair_prob is None or s.touch is None:
         return None
 
-    # Hard filters
     seconds = _seconds_since_score(s)
     if seconds is None or seconds > POLL_INTERVAL_SECONDS * 1.5:
         return None
@@ -699,7 +664,6 @@ def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
         "role": role,
     }
 
-    # Adaptive threshold: slightly stricter in high vol
     threshold = MARKOV_DIVERGENCE * (1.15 if high_vol else 1.0)
 
     if s.touch == "upper" and divergence > threshold:
@@ -711,10 +675,7 @@ def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
             case_id="C5_MARKOV_FAIRVALUE",
             direction="fade",
             title="UPPER TOUCH ABOVE MARKOV FAIR VALUE",
-            reason=(
-                f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} "
-                f"(+{divergence:.3f}) after recent score change."
-            ),
+            reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} (+{divergence:.3f}) after recent score change.",
             trade_action="FADE. Buy the opposite outcome.",
             confidence=conf,
             details=details,
@@ -729,10 +690,7 @@ def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
             case_id="C5_MARKOV_FAIRVALUE",
             direction="fade",
             title="LOWER TOUCH BELOW MARKOV FAIR VALUE",
-            reason=(
-                f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} "
-                f"({divergence:.3f}) after recent score change."
-            ),
+            reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} ({divergence:.3f}) after recent score change.",
             trade_action="FADE. Buy the underpriced side.",
             confidence=conf,
             details=details,
@@ -742,7 +700,6 @@ def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
 
 
 def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
-    """Enhanced C6 (same as previously delivered)."""
     if s.touch is None:
         return None
 
@@ -750,7 +707,6 @@ def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
     if role == "unknown":
         return None
 
-    # Hard filters
     if s.last_score_change_ts is None:
         return None
     seconds_since_score = (datetime.now() - s.last_score_change_ts).total_seconds()
@@ -766,7 +722,7 @@ def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
     if dist is None or dist < 0.006:
         return None
 
-    is_favorite_dip   = (role == "favorite" and s.touch == "lower")
+    is_favorite_dip = (role == "favorite" and s.touch == "lower")
     is_underdog_spike = (role == "underdog" and s.touch == "upper")
 
     if not (is_favorite_dip or is_underdog_spike):
@@ -854,7 +810,7 @@ def run_all_cases(s: MarketSnapshot) -> List[Signal]:
 
 
 # ============================================================================
-# DISCOVERY — LIVE MATCHES ONLY
+# DISCOVERY — SINGLES ONLY
 # ============================================================================
 
 def discover_tennis_markets_all() -> List[Dict[str, Any]]:
@@ -865,19 +821,26 @@ def discover_tennis_markets_all() -> List[Dict[str, Any]]:
         )
         for m in all_markets:
             text = f"{m.question} {m.slug}".lower()
+
+            # Skip doubles
+            if "doubles" in text or "double" in text:
+                continue
+
             tour = None
-            if "atp" in text:
+            if "atp" in text or "masters" in text or "1000" in text or "finals" in text:
                 tour = "ATP"
             elif "wta" in text:
                 tour = "WTA"
+
             if tour is None:
                 continue
+
             out.append({"market": m, "tour": tour})
     return out
 
 
 # ============================================================================
-# FAVORITE / UNDERDOG IDENTIFICATION (discreet ntfy tag)
+# FAVORITE / UNDERDOG + NTFY
 # ============================================================================
 
 def _identify_favorite_underdog(
@@ -887,19 +850,16 @@ def _identify_favorite_underdog(
     if len(outcomes) != 2:
         return None, None
 
-    p0 = None
-    p1 = None
-
+    p0 = p1 = None
     if isinstance(s.current_price, (int, float)):
         try:
             p0 = float(s.current_price)
             p1 = 1.0 - p0
         except Exception:
-            p0, p1 = None, None
+            pass
 
-    if s.role == "underdog" and p0 is not None and p1 is not None:
-        if p0 > p1:
-            p0, p1 = p1, p0
+    if s.role == "underdog" and p0 is not None and p1 is not None and p0 > p1:
+        p0, p1 = p1, p0
 
     if p0 is None or p1 is None:
         return None, None
@@ -916,14 +876,10 @@ def _discreet_role_tag(s: MarketSnapshot) -> str:
 
     def _short(name: str, limit: int = 22) -> str:
         name = str(name).strip()
-        return name if len(name) <= limit else name[: limit - 1] + "…"
+        return name if len(name) <= limit else name[:limit-1] + "…"
 
     return f"fav: {_short(fav)} | dog: {_short(dog)}"
 
-
-# ============================================================================
-# NTFY FORMATTER
-# ============================================================================
 
 DIRECTION_ICON = {"fade": "🟡 FADE", "follow": "🟢 FOLLOW", "info": "ℹ️ INFO"}
 DIRECTION_TAG = {"fade": "warning", "follow": "white_check_mark", "info": "information_source"}
@@ -1001,7 +957,7 @@ class TennisBollingerScanner:
         if not key:
             raise ValueError("LIVETENNIS_API_KEY not set.")
         self.live_client = LiveTennisClient(api_key=key)
-        print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only). "
+        print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only, SINGLES only). "
               f"Cases: {sorted(ENABLED_CASES)}")
         print(f"[{datetime.now()}] relay URL: {PA_RELAY_URL}")
         print(f"[{datetime.now()}] poll interval: {POLL_INTERVAL_SECONDS}s  "
@@ -1012,25 +968,31 @@ class TennisBollingerScanner:
         )
         print(f"[{datetime.now()}] per-case cooldowns: {cd_summary}")
 
-    def _get_live_matches(self) -> List:
+    def _get_live_matches(self, force: bool = False) -> List:
         now = datetime.now()
-        if (self._live_matches_ts is not None
-                and (now - self._live_matches_ts).total_seconds()
-                    < LIVE_MATCHES_CACHE_SECONDS):
+
+        use_cache = (
+            not force
+            and self._live_matches_ts is not None
+            and (now - self._live_matches_ts).total_seconds() < LIVE_MATCHES_CACHE_SECONDS
+            and len(self._live_matches_cache) > 0
+        )
+
+        if use_cache:
             age = (now - self._live_matches_ts).total_seconds()
             print(f"  [match] using cached live list "
                   f"({len(self._live_matches_cache)} matches, age {age:.0f}s)")
             return self._live_matches_cache
 
         try:
-            self._live_matches_cache = self.live_client.live_matches()
+            fresh = self.live_client.live_matches()
+            self._live_matches_cache = fresh if fresh is not None else []
+            self._live_matches_ts = now
+            print(f"  [match] fetched {len(self._live_matches_cache)} live "
+                  f"matches from Live Tennis API")
         except Exception as e:
             print(f"  ! live_matches() failed: {e}")
-            return self._live_matches_cache
 
-        self._live_matches_ts = now
-        print(f"  [match] fetched {len(self._live_matches_cache)} live "
-              f"matches from Live Tennis API")
         return self._live_matches_cache
 
     def _get_view(self, market, match):
@@ -1159,7 +1121,7 @@ class TennisBollingerScanner:
             band_width_pct = (up - lo) / mid * 100.0 if mid else 0.0
             touch_tag = touch if touch else "-"
             print(
-                f"\'' {slug[:45]:<45}  "
+                f"  \' {slug[:45]:<45}  "
                 f"px={px:.4f}  "
                 f"to_up={dist_up_pct:+.2f}%  "
                 f"to_lo={dist_lo_pct:+.2f}%  "
@@ -1242,28 +1204,71 @@ class TennisBollingerScanner:
 
     def match_markets_to_live(self, discovered) -> List:
         live = self._get_live_matches()
+
+        if len(live) == 0:
+            print("  [match] empty live list → forcing refresh")
+            live = self._get_live_matches(force=True)
+
+        # Keep only singles
+        singles = []
+        for m in live:
+            if isinstance(m, dict):
+                is_doubles = m.get("is_doubles", False)
+                draw = (m.get("draw") or "").lower()
+                if is_doubles or draw == "doubles":
+                    continue
+                singles.append(m)
+            else:
+                singles.append(m)
+
+        print(f"  [match] LiveTennis: {len(live)} total → {len(singles)} singles")
+
+        # Better debug print
+        for m in singles[:8]:
+            if isinstance(m, dict):
+                players = m.get("players")
+                if isinstance(players, list) and len(players) >= 2:
+                    p1 = players[0].get("name") if isinstance(players[0], dict) else str(players[0])
+                    p2 = players[1].get("name") if isinstance(players[1], dict) else str(players[1])
+                    name = f"{p1} vs {p2}"
+                else:
+                    name = str(players)[:80] if players else "?"
+                tour = m.get("tour") or m.get("tournament") or "?"
+                print(f"    • [{tour}] {name}")
+            else:
+                print(f"    • {m}")
+
         paired = []
+        unmatched = 0
+
         for entry in discovered:
             m = entry["market"]
             tour = entry["tour"]
             try:
-                d = match_market(m, live)
-                if d and d.match:
+                d = match_market(m, singles)
+                if d and getattr(d, "match", None):
                     paired.append({
                         "market": m,
                         "match": d.match,
-                        "confidence": d.confidence,
+                        "confidence": getattr(d, "confidence", None),
                         "tour": tour,
                     })
+                    print(f"  [match OK] {m.slug}")
+                else:
+                    unmatched += 1
+                    print(f"  [no match] {m.slug}")
             except Exception as e:
-                print(f"  ! match error for {m.slug}: {e}")
+                unmatched += 1
+                print(f"  [match error] {m.slug}: {e}")
+
+        print(f"  [match] result → {len(paired)} paired, {unmatched} unmatched")
         return paired
 
     def scan_once(self):
         self.scan_count += 1
         print(f"\n[{datetime.now()}] scan start (cycle {self.scan_count})")
         discovered = discover_tennis_markets_all()
-        print(f"  discovered: {len(discovered)}")
+        print(f"  discovered (singles only): {len(discovered)}")
         if not discovered:
             return
         paired = self.match_markets_to_live(discovered)
@@ -1294,7 +1299,7 @@ class TennisBollingerScanner:
 
 
 # ============================================================================
-# FLASK WRAPPER (Render health/status endpoints)
+# FLASK WRAPPER
 # ============================================================================
 
 import threading
@@ -1326,7 +1331,7 @@ def _start_scanner_once():
 @app.route("/")
 def root():
     _start_scanner_once()
-    return "Tennis scanner is running", 200
+    return "Tennis scanner is running (singles only)", 200
 
 
 @app.route("/scanner-status")
