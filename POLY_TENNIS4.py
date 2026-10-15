@@ -41,7 +41,6 @@ from polymarket_tennis import (
 # RELAY CONFIGURATION (PythonAnywhere -> ntfy.sh)
 # ============================================================================
 
-# Render posts alerts here; PythonAnywhere forwards them to ntfy.sh.
 PA_RELAY_URL = os.environ.get(
     "PA_RELAY_URL",
     "https://jharjula.pythonanywhere.com/relay",
@@ -234,10 +233,6 @@ def fetch_price_history(token_id: str, hours_back: int = HISTORY_HOURS
 # ============================================================================
 
 class RelayClient:
-    """
-    Sends alerts to the PythonAnywhere relay endpoint, which then forwards
-    them to ntfy.sh from PythonAnywhere's clean egress IP.
-    """
     def __init__(self, relay_url: str):
         self.relay_url = relay_url
         self._last_send_ts = 0.0
@@ -341,10 +336,6 @@ def market_is_near_resolved(price: float) -> bool:
     return price >= PRICE_NEAR_CERTAIN or price <= PRICE_NEAR_HOPELESS
 
 
-# ============================================================================
-# BOLLINGER BANDS
-# ============================================================================
-
 def calculate_bollinger_bands(prices: pd.Series, period: int = BOLLINGER_PERIOD,
                               std_mult: float = BOLLINGER_STD
                               ) -> Optional[Dict[str, float]]:
@@ -372,10 +363,6 @@ def detect_band_touch(price: float, bands: Optional[Dict[str, float]],
     return None
 
 
-# ============================================================================
-# MARKOV (rough)
-# ============================================================================
-
 def estimate_markov_fair_prob(score_line: str, server: Optional[str],
                               player_of_interest: str) -> Optional[float]:
     if not score_line:
@@ -402,87 +389,225 @@ def estimate_markov_fair_prob(score_line: str, server: Optional[str],
 
 
 # ============================================================================
-# SIX CASE DETECTORS
+# SHARED HELPERS FOR IMPROVED CASES
+# ============================================================================
+
+def _get_current_role(s: MarketSnapshot) -> str:
+    """Dynamically determine favorite / underdog."""
+    if len(s.outcomes) != 2:
+        return s.role if s.role != "unknown" else "unknown"
+
+    p = s.current_price
+    if p >= 0.55:
+        role_from_price = "favorite"
+    elif p <= 0.45:
+        role_from_price = "underdog"
+    else:
+        role_from_price = "unknown"
+
+    if s.markov_fair_prob is not None:
+        role_from_markov = "favorite" if s.markov_fair_prob >= 0.55 else "underdog"
+        if role_from_price == role_from_markov:
+            return role_from_price
+        if role_from_price == "unknown":
+            return role_from_markov
+
+    if role_from_price != "unknown":
+        return role_from_price
+    return s.role if s.role != "unknown" else "unknown"
+
+
+def _touch_distance(s: MarketSnapshot) -> Optional[float]:
+    """How far outside the band the price is (positive = outside)."""
+    if s.bands is None or s.touch is None:
+        return None
+    if s.touch == "upper":
+        return s.current_price - s.bands["upper"]
+    if s.touch == "lower":
+        return s.bands["lower"] - s.current_price
+    return None
+
+
+def _is_high_vol(s: MarketSnapshot) -> bool:
+    if len(s.recent_prices) < BOLLINGER_PERIOD:
+        return False
+    tail = pd.Series(s.recent_prices[-BOLLINGER_PERIOD:])
+    iqr = float(tail.quantile(0.75) - tail.quantile(0.25))
+    return iqr >= VOL_HIGH_IQR
+
+
+def _seconds_since_score(s: MarketSnapshot) -> Optional[float]:
+    if s.last_score_change_ts is None:
+        return None
+    return (datetime.now() - s.last_score_change_ts).total_seconds()
+
+
+# ============================================================================
+# SIX CASE DETECTORS (IMPROVED)
 # ============================================================================
 
 def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
+    """Improved C1: Role-aware + penetration + Markov confirmation."""
     if not s.break_point_flag or s.touch is None:
         return None
+
+    dist = _touch_distance(s)
+    if dist is None or dist < 0.006:
+        return None
+
+    # Ignore pure changeover noise
+    if s.last_point_time is not None:
+        gap = (datetime.now() - s.last_point_time).total_seconds()
+        if gap >= CHANGEOVER_THRESHOLD_S:
+            return None
+
+    role = _get_current_role(s)
+    high_vol = _is_high_vol(s)
+
+    confidence = "MEDIUM"
+    details = {
+        "server": s.server,
+        "receiver": s.receiver,
+        "role": role,
+        "touch_distance": round(dist, 4),
+    }
+
+    # Markov confirmation boosts confidence
+    if s.markov_fair_prob is not None:
+        div = abs(s.current_price - s.markov_fair_prob)
+        details["markov_div"] = round(div, 4)
+        if div >= MARKOV_DIVERGENCE:
+            confidence = "HIGH"
+
+    if high_vol and confidence == "HIGH":
+        confidence = "MEDIUM"
+
     if s.touch == "upper":
-        return Signal(
-            case_id="C1_BREAKPOINT_CONTEXT",
-            direction="fade",
-            title="BREAK POINT + UPPER TOUCH",
-            reason=(f"Server ({s.server}) odds spiked to upper band while "
-                    "facing break point. Market overrating the save."),
-            trade_action=(f"FADE the server ({s.server}). "
-                          f"Consider buying {s.receiver} at current price."),
-            confidence="HIGH",
-            details={"server": s.server, "receiver": s.receiver},
+        # Server odds spiked while facing break point
+        title = "BREAK POINT + UPPER TOUCH"
+        reason = (
+            f"Server ({s.server}) odds spiked to upper band while facing break point. "
+            "Market overrating the save."
         )
+        trade_action = (
+            f"FADE the server ({s.server}). Consider buying {s.receiver}."
+        )
+        # Stronger when the server is the favorite
+        if role == "favorite":
+            confidence = "HIGH" if confidence != "LOW" else confidence
+    else:
+        # Receiver odds dropped while holding break point
+        title = "BREAK POINT + LOWER TOUCH"
+        reason = (
+            f"Receiver ({s.receiver}) odds dropped to lower band while holding break point. "
+            "Market overrating the miss."
+        )
+        trade_action = f"FADE the market. Consider buying {s.receiver}."
+
     return Signal(
         case_id="C1_BREAKPOINT_CONTEXT",
         direction="fade",
-        title="BREAK POINT + LOWER TOUCH",
-        reason=(f"Receiver ({s.receiver}) odds dropped to lower band while "
-                "holding break point. Market overrating the miss."),
-        trade_action=f"FADE the market. Consider buying {s.receiver}.",
-        confidence="HIGH",
-        details={"server": s.server, "receiver": s.receiver},
+        title=title,
+        reason=reason,
+        trade_action=trade_action,
+        confidence=confidence,
+        details=details,
     )
 
 
 def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
+    """Improved C2: Tighter window, direction awareness, volatility filter."""
     if s.touch is None:
         return None
-    if s.last_score_change_ts is None:
+
+    dist = _touch_distance(s)
+    if dist is None or dist < 0.005:
+        return None
+
+    seconds = _seconds_since_score(s)
+    high_vol = _is_high_vol(s)
+
+    if seconds is None:
         return Signal(
-            case_id="C2_SCORE_DRIVEN", direction="info",
+            case_id="C2_SCORE_DRIVEN",
+            direction="info",
             title=f"{s.touch.upper()} TOUCH — no score context",
             reason="Band touch but no recorded score change yet.",
             trade_action="WAIT for next scan to establish score context.",
             confidence="LOW",
+            details={"touch_distance": round(dist, 4)},
         )
-    since = (datetime.now() - s.last_score_change_ts).total_seconds()
-    if since <= POLL_INTERVAL_SECONDS + 10:
+
+    # Tighter recent window for Follow
+    recent_window = POLL_INTERVAL_SECONDS * 0.85   # \~12.75 min
+
+    if seconds <= recent_window:
+        # Potential Follow
+        if high_vol:
+            conf = "MEDIUM"
+            extra = " (high-vol regime — reduced confidence)"
+        else:
+            conf = "HIGH"
+            extra = ""
+
         return Signal(
-            case_id="C2_SCORE_DRIVEN", direction="follow",
+            case_id="C2_SCORE_DRIVEN",
+            direction="follow",
             title=f"{s.touch.upper()} TOUCH — REAL SCORE MOVE",
-            reason=f"Score changed {since:.0f}s ago. Event-driven repricing.",
-            trade_action=(f"FOLLOW the move. Buy the player whose odds "
-                          f"touched the {s.touch} band."),
-            confidence="HIGH",
-            details={"seconds_since_score_change": since},
+            reason=(
+                f"Score changed {seconds:.0f}s ago. Event-driven repricing"
+                f"{extra}."
+            ),
+            trade_action=(
+                f"FOLLOW the move. Buy the player whose odds touched the {s.touch} band."
+            ),
+            confidence=conf,
+            details={
+                "seconds_since_score_change": round(seconds, 1),
+                "touch_distance": round(dist, 4),
+                "high_vol": high_vol,
+            },
         )
+
+    # Stale touch → Fade
     return Signal(
-        case_id="C2_SCORE_DRIVEN", direction="fade",
+        case_id="C2_SCORE_DRIVEN",
+        direction="fade",
         title=f"{s.touch.upper()} TOUCH — NO RECENT SCORE CHANGE",
-        reason=f"Score unchanged for {since:.0f}s but odds touched a band.",
+        reason=f"Score unchanged for {seconds:.0f}s but odds touched a band.",
         trade_action=f"FADE. Buy the OPPOSITE side of the {s.touch} touch.",
         confidence="MEDIUM",
-        details={"seconds_since_score_change": since},
+        details={
+            "seconds_since_score_change": round(seconds, 1),
+            "touch_distance": round(dist, 4),
+        },
     )
 
 
 def case_3_timebreak(s: MarketSnapshot) -> Optional[Signal]:
+    """C3: Changeover / long-gap noise filter (kept defensive)."""
     if s.touch is None or s.last_point_time is None:
         return None
+
     gap = (datetime.now() - s.last_point_time).total_seconds()
     if gap >= CHANGEOVER_THRESHOLD_S:
         return Signal(
-            case_id="C3_TIMEBREAK_NOISE", direction="fade",
+            case_id="C3_TIMEBREAK_NOISE",
+            direction="fade",
             title="BAND TOUCH DURING CHANGEOVER",
             reason=f"No point for {gap:.0f}s. Band touches here are noise.",
             trade_action="DO NOT CHASE. Wait for play to resume.",
             confidence="HIGH",
-            details={"gap_seconds": gap},
+            details={"gap_seconds": round(gap, 1)},
         )
     return None
 
 
 def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
+    """Improved C4: Clearer regime handling."""
     if s.touch is None or len(s.recent_prices) < BOLLINGER_PERIOD:
         return None
+
     tail = pd.Series(s.recent_prices[-BOLLINGER_PERIOD:])
     q1, q3 = float(tail.quantile(0.25)), float(tail.quantile(0.75))
     iqr = q3 - q1
@@ -490,93 +615,216 @@ def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
     if iqr < MIN_IQR:
         return None
 
+    dist = _touch_distance(s)
+    details = {"iqr": round(iqr, 4)}
+    if dist is not None:
+        details["touch_distance"] = round(dist, 4)
+
+    # High volatility → ignore
     if iqr >= VOL_HIGH_IQR:
         return Signal(
-            case_id="C4_VOLATILITY_ADJUSTED", direction="info",
+            case_id="C4_VOLATILITY_ADJUSTED",
+            direction="info",
             title=f"{s.touch.upper()} TOUCH IN HIGH-VOL REGIME",
-            reason=f"IQR={iqr:.4f} (high). Bands too narrow.",
-            trade_action="IGNORE unless confirmed by C2 or C1.",
+            reason=f"IQR={iqr:.4f} (high). Bands too noisy.",
+            trade_action="IGNORE unless confirmed by C1, C2 or C5.",
             confidence="LOW",
-            details={"iqr": iqr, "regime": "high"},
+            details={**details, "regime": "high"},
         )
 
+    # Low volatility
     if iqr <= VOL_LOW_IQR:
+        seconds = _seconds_since_score(s)
         recently_active = (
-            s.last_score_change_ts is not None
-            and (datetime.now() - s.last_score_change_ts).total_seconds()
-                <= C4_RECENT_ACTIVITY_WINDOW_S
+            seconds is not None and seconds <= C4_RECENT_ACTIVITY_WINDOW_S
         )
+
         if not recently_active:
             return Signal(
-                case_id="C4_VOLATILITY_ADJUSTED", direction="info",
+                case_id="C4_VOLATILITY_ADJUSTED",
+                direction="info",
                 title=f"{s.touch.upper()} TOUCH IN LOW-VOL (STALE)",
-                reason=(f"IQR={iqr:.4f} low but no recent score activity. "
-                        "Quiet market — touch is likely noise."),
+                reason=(
+                    f"IQR={iqr:.4f} low but no recent score activity. "
+                    "Quiet market — touch is likely noise."
+                ),
                 trade_action="IGNORE — no score context to justify FOLLOW.",
                 confidence="LOW",
-                details={"iqr": iqr, "regime": "low-stale"},
+                details={**details, "regime": "low-stale"},
             )
+
         return Signal(
-            case_id="C4_VOLATILITY_ADJUSTED", direction="follow",
+            case_id="C4_VOLATILITY_ADJUSTED",
+            direction="follow",
             title=f"{s.touch.upper()} TOUCH IN LOW-VOL REGIME",
-            reason=f"IQR={iqr:.4f} (low). Band touch is meaningful.",
+            reason=f"IQR={iqr:.4f} (low) + recent score activity. Band touch is meaningful.",
             trade_action=f"FOLLOW. Buy the {s.touch} band touch side.",
             confidence="MEDIUM",
-            details={"iqr": iqr, "regime": "low-active"},
+            details={**details, "regime": "low-active"},
         )
 
+    # Medium volatility — neutral, no signal
     return None
 
 
 def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
+    """Improved C5: Requires recent activity + penetration + better confidence."""
     if s.markov_fair_prob is None or s.touch is None:
         return None
+
+    # Hard filters
+    seconds = _seconds_since_score(s)
+    if seconds is None or seconds > POLL_INTERVAL_SECONDS * 1.5:
+        return None
+
+    dist = _touch_distance(s)
+    if dist is None or dist < 0.006:
+        return None
+
+    if s.last_point_time is not None:
+        gap = (datetime.now() - s.last_point_time).total_seconds()
+        if gap >= CHANGEOVER_THRESHOLD_S:
+            return None
+
     divergence = s.current_price - s.markov_fair_prob
-    if s.touch == "upper" and divergence > MARKOV_DIVERGENCE:
+    high_vol = _is_high_vol(s)
+    role = _get_current_role(s)
+
+    details = {
+        "divergence": round(divergence, 4),
+        "markov_fair": round(s.markov_fair_prob, 4),
+        "price": round(s.current_price, 4),
+        "touch_distance": round(dist, 4),
+        "seconds_since_score": round(seconds, 1),
+        "role": role,
+    }
+
+    # Adaptive threshold: slightly stricter in high vol
+    threshold = MARKOV_DIVERGENCE * (1.15 if high_vol else 1.0)
+
+    if s.touch == "upper" and divergence > threshold:
+        conf = "HIGH" if abs(divergence) >= threshold * 1.3 else "MEDIUM"
+        if high_vol and conf == "HIGH":
+            conf = "MEDIUM"
+
         return Signal(
-            case_id="C5_MARKOV_FAIRVALUE", direction="fade",
+            case_id="C5_MARKOV_FAIRVALUE",
+            direction="fade",
             title="UPPER TOUCH ABOVE MARKOV FAIR VALUE",
-            reason=(f"Market {s.current_price:.3f} vs Markov "
-                    f"{s.markov_fair_prob:.3f} (+{divergence:.3f})."),
+            reason=(
+                f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} "
+                f"(+{divergence:.3f}) after recent score change."
+            ),
             trade_action="FADE. Buy the opposite outcome.",
-            confidence="HIGH",
-            details={"divergence": divergence},
+            confidence=conf,
+            details=details,
         )
-    if s.touch == "lower" and -divergence > MARKOV_DIVERGENCE:
+
+    if s.touch == "lower" and -divergence > threshold:
+        conf = "HIGH" if abs(divergence) >= threshold * 1.3 else "MEDIUM"
+        if high_vol and conf == "HIGH":
+            conf = "MEDIUM"
+
         return Signal(
-            case_id="C5_MARKOV_FAIRVALUE", direction="fade",
+            case_id="C5_MARKOV_FAIRVALUE",
+            direction="fade",
             title="LOWER TOUCH BELOW MARKOV FAIR VALUE",
-            reason=(f"Market {s.current_price:.3f} vs Markov "
-                    f"{s.markov_fair_prob:.3f} ({divergence:.3f})."),
+            reason=(
+                f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} "
+                f"({divergence:.3f}) after recent score change."
+            ),
             trade_action="FADE. Buy the underpriced side.",
-            confidence="HIGH",
-            details={"divergence": divergence},
+            confidence=conf,
+            details=details,
         )
+
     return None
 
 
 def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
-    if s.touch is None or s.role == "unknown":
+    """Enhanced C6 (same as previously delivered)."""
+    if s.touch is None:
         return None
-    if s.role == "favorite" and s.touch == "lower":
-        return Signal(
-            case_id="C6_FAVORITE_LONGSHOT", direction="fade",
-            title="FAVORITE HIT LOWER BAND",
-            reason="Market over-fearing underdog momentum.",
-            trade_action="FADE. Buy the FAVORITE — likely underpriced.",
-            confidence="MEDIUM",
-            details={"role": s.role},
+
+    role = _get_current_role(s)
+    if role == "unknown":
+        return None
+
+    # Hard filters
+    if s.last_score_change_ts is None:
+        return None
+    seconds_since_score = (datetime.now() - s.last_score_change_ts).total_seconds()
+    if seconds_since_score > POLL_INTERVAL_SECONDS * 1.5:
+        return None
+
+    if s.last_point_time is not None:
+        gap = (datetime.now() - s.last_point_time).total_seconds()
+        if gap >= CHANGEOVER_THRESHOLD_S:
+            return None
+
+    dist = _touch_distance(s)
+    if dist is None or dist < 0.006:
+        return None
+
+    is_favorite_dip   = (role == "favorite" and s.touch == "lower")
+    is_underdog_spike = (role == "underdog" and s.touch == "upper")
+
+    if not (is_favorite_dip or is_underdog_spike):
+        return None
+
+    high_vol = _is_high_vol(s)
+
+    confidence = "MEDIUM"
+    details = {
+        "role": role,
+        "price": round(s.current_price, 4),
+        "touch_distance": round(dist, 4),
+        "seconds_since_score": round(seconds_since_score, 1),
+    }
+
+    if s.markov_fair_prob is not None:
+        markov_div = s.markov_fair_prob - s.current_price
+        details["markov_fair"] = round(s.markov_fair_prob, 4)
+        details["markov_div"] = round(markov_div, 4)
+        if abs(markov_div) >= MARKOV_DIVERGENCE:
+            confidence = "HIGH"
+
+    if is_favorite_dip and s.current_price >= 0.62:
+        confidence = "HIGH"
+    if is_underdog_spike and s.current_price <= 0.38:
+        confidence = "HIGH"
+
+    if high_vol and confidence == "HIGH":
+        confidence = "MEDIUM"
+    elif high_vol:
+        details["vol_regime"] = "high"
+
+    if is_favorite_dip:
+        title = "FAVORITE HIT LOWER BAND"
+        reason = (
+            f"Favorite odds dropped to lower band (dist={dist:.3f}) "
+            f"after recent score change ({seconds_since_score:.0f}s ago). "
+            "Market over-fearing underdog momentum."
         )
-    if s.role == "underdog" and s.touch == "upper":
-        return Signal(
-            case_id="C6_FAVORITE_LONGSHOT", direction="fade",
-            title="UNDERDOG HIT UPPER BAND",
-            reason="Market over-valuing a short underdog run.",
-            trade_action="FADE. Buy the FAVORITE — underdog overpriced.",
-            confidence="MEDIUM",
-            details={"role": s.role},
+        trade_action = "FADE. Buy the FAVORITE — likely underpriced."
+    else:
+        title = "UNDERDOG HIT UPPER BAND"
+        reason = (
+            f"Underdog odds spiked to upper band (dist={dist:.3f}) "
+            f"after recent score change ({seconds_since_score:.0f}s ago). "
+            "Market over-valuing a short run."
         )
-    return None
+        trade_action = "FADE. Buy the FAVORITE — underdog overpriced."
+
+    return Signal(
+        case_id="C6_FAVORITE_LONGSHOT",
+        direction="fade",
+        title=title,
+        reason=reason,
+        trade_action=trade_action,
+        confidence=confidence,
+        details=details,
+    )
 
 
 CASE_DETECTORS = {
@@ -610,9 +858,6 @@ def run_all_cases(s: MarketSnapshot) -> List[Signal]:
 # ============================================================================
 
 def discover_tennis_markets_all() -> List[Dict[str, Any]]:
-    """
-    Returns list of dicts: {"market": <market>, "tour": "ATP"|"WTA"}.
-    """
     out: List[Dict[str, Any]] = []
     with GammaClient() as gamma:
         all_markets = discover_tennis_markets(
@@ -638,17 +883,6 @@ def discover_tennis_markets_all() -> List[Dict[str, Any]]:
 def _identify_favorite_underdog(
     s: MarketSnapshot,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Identify which player is the favorite and which is the underdog.
-
-    Uses multiple signals in priority order:
-      1. Outcomes length must be exactly 2 (binary market).
-      2. Derive from current_price: the higher-priced side is the favorite
-         since Polymarket prices approximate implied probability.
-      3. Respect s.role to correct orientation if needed.
-
-    Returns (favorite_name, underdog_name) or (None, None) if unresolvable.
-    """
     outcomes = list(s.outcomes or [])
     if len(outcomes) != 2:
         return None, None
@@ -656,8 +890,6 @@ def _identify_favorite_underdog(
     p0 = None
     p1 = None
 
-    # current_price tracks the token for outcomes[0] (the first CLOB token
-    # id returned by gamma), so we can treat it as p0.
     if isinstance(s.current_price, (int, float)):
         try:
             p0 = float(s.current_price)
@@ -665,7 +897,6 @@ def _identify_favorite_underdog(
         except Exception:
             p0, p1 = None, None
 
-    # If role hints flip the orientation, respect it.
     if s.role == "underdog" and p0 is not None and p1 is not None:
         if p0 > p1:
             p0, p1 = p1, p0
@@ -679,11 +910,6 @@ def _identify_favorite_underdog(
 
 
 def _discreet_role_tag(s: MarketSnapshot) -> str:
-    """
-    Build a short, low-key tag for the ntfy message body.
-    Example: 'fav: Djokovic | dog: Alcaraz'
-    Kept intentionally understated (no emojis, no all-caps).
-    """
     fav, dog = _identify_favorite_underdog(s)
     if not fav or not dog:
         return ""
@@ -732,11 +958,6 @@ def format_ntfy_body(sig: Signal, s: MarketSnapshot) -> str:
 
 
 def format_ntfy_body_with_roles(sig: Signal, s: MarketSnapshot) -> str:
-    """
-    Same output as format_ntfy_body(), but appends a discreet role line
-    identifying favorite and underdog. Falls back to the original body
-    when roles can't be resolved (e.g., non-binary market).
-    """
     base = format_ntfy_body(sig, s)
     tag = _discreet_role_tag(s)
     if not tag:
@@ -938,7 +1159,7 @@ class TennisBollingerScanner:
             band_width_pct = (up - lo) / mid * 100.0 if mid else 0.0
             touch_tag = touch if touch else "-"
             print(
-                f"  ~ {slug[:45]:<45}  "
+                f"\'' {slug[:45]:<45}  "
                 f"px={px:.4f}  "
                 f"to_up={dist_up_pct:+.2f}%  "
                 f"to_lo={dist_lo_pct:+.2f}%  "
