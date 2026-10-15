@@ -5,9 +5,9 @@ Six-case alerts for LIVE matches only, with per-case cooldowns and
 rate-limit-friendly API caching. Observe-only — no orders are placed.
 
 This version:
-- Skips all doubles (both Polymarket + LiveTennis)
-- Better LiveTennis debug printing (shows real player names)
-- Improved C1–C6 strategies
+- Skips all doubles (Polymarket + LiveTennis)
+- Only sends ntfy when a Bollinger band is touched
+- Mentions C6 inside the ntfy message when it applies
 """
 
 import os
@@ -75,7 +75,7 @@ LIVETENNIS_API_KEY = os.environ.get(
 )
 
 POLL_INTERVAL_SECONDS = 900
-LIVE_MATCHES_CACHE_SECONDS = 180          # 3 minutes
+LIVE_MATCHES_CACHE_SECONDS = 180
 VIEW_CACHE_SECONDS = 900
 
 BOLLINGER_PERIOD = 20
@@ -112,6 +112,9 @@ CASE_SPECIFIC_COOLDOWN = {
     "C5_MARKOV_FAIRVALUE":    900,
     "C6_FAVORITE_LONGSHOT":   900,
 }
+
+# Special cooldown for band-touch alerts
+BAND_TOUCH_COOLDOWN_SECONDS = 600
 
 # ============================================================================
 # API ENDPOINTS AND CACHES
@@ -441,220 +444,142 @@ def _seconds_since_score(s: MarketSnapshot) -> Optional[float]:
 
 
 # ============================================================================
-# SIX CASE DETECTORS
+# SIX CASE DETECTORS (still used for console + C6 detection)
 # ============================================================================
 
 def case_1_breakpoint(s: MarketSnapshot) -> Optional[Signal]:
     if not s.break_point_flag or s.touch is None:
         return None
-
     dist = _touch_distance(s)
     if dist is None or dist < 0.006:
         return None
-
     if s.last_point_time is not None:
         gap = (datetime.now() - s.last_point_time).total_seconds()
         if gap >= CHANGEOVER_THRESHOLD_S:
             return None
-
     role = _get_current_role(s)
     high_vol = _is_high_vol(s)
-
     confidence = "MEDIUM"
-    details = {
-        "server": s.server,
-        "receiver": s.receiver,
-        "role": role,
-        "touch_distance": round(dist, 4),
-    }
-
+    details = {"server": s.server, "receiver": s.receiver, "role": role, "touch_distance": round(dist, 4)}
     if s.markov_fair_prob is not None:
         div = abs(s.current_price - s.markov_fair_prob)
         details["markov_div"] = round(div, 4)
         if div >= MARKOV_DIVERGENCE:
             confidence = "HIGH"
-
     if high_vol and confidence == "HIGH":
         confidence = "MEDIUM"
-
     if s.touch == "upper":
         title = "BREAK POINT + UPPER TOUCH"
-        reason = (
-            f"Server ({s.server}) odds spiked to upper band while facing break point. "
-            "Market overrating the save."
-        )
+        reason = f"Server ({s.server}) odds spiked to upper band while facing break point. Market overrating the save."
         trade_action = f"FADE the server ({s.server}). Consider buying {s.receiver}."
         if role == "favorite":
             confidence = "HIGH" if confidence != "LOW" else confidence
     else:
         title = "BREAK POINT + LOWER TOUCH"
-        reason = (
-            f"Receiver ({s.receiver}) odds dropped to lower band while holding break point. "
-            "Market overrating the miss."
-        )
+        reason = f"Receiver ({s.receiver}) odds dropped to lower band while holding break point. Market overrating the miss."
         trade_action = f"FADE the market. Consider buying {s.receiver}."
-
-    return Signal(
-        case_id="C1_BREAKPOINT_CONTEXT",
-        direction="fade",
-        title=title,
-        reason=reason,
-        trade_action=trade_action,
-        confidence=confidence,
-        details=details,
-    )
+    return Signal(case_id="C1_BREAKPOINT_CONTEXT", direction="fade", title=title,
+                  reason=reason, trade_action=trade_action, confidence=confidence, details=details)
 
 
 def case_2_score_driven(s: MarketSnapshot) -> Optional[Signal]:
     if s.touch is None:
         return None
-
     dist = _touch_distance(s)
     if dist is None or dist < 0.005:
         return None
-
     seconds = _seconds_since_score(s)
     high_vol = _is_high_vol(s)
-
     if seconds is None:
-        return Signal(
-            case_id="C2_SCORE_DRIVEN",
-            direction="info",
-            title=f"{s.touch.upper()} TOUCH — no score context",
-            reason="Band touch but no recorded score change yet.",
-            trade_action="WAIT for next scan to establish score context.",
-            confidence="LOW",
-            details={"touch_distance": round(dist, 4)},
-        )
-
+        return Signal(case_id="C2_SCORE_DRIVEN", direction="info",
+                      title=f"{s.touch.upper()} TOUCH — no score context",
+                      reason="Band touch but no recorded score change yet.",
+                      trade_action="WAIT for next scan to establish score context.",
+                      confidence="LOW", details={"touch_distance": round(dist, 4)})
     recent_window = POLL_INTERVAL_SECONDS * 0.85
-
     if seconds <= recent_window:
         conf = "MEDIUM" if high_vol else "HIGH"
         extra = " (high-vol regime — reduced confidence)" if high_vol else ""
-
-        return Signal(
-            case_id="C2_SCORE_DRIVEN",
-            direction="follow",
-            title=f"{s.touch.upper()} TOUCH — REAL SCORE MOVE",
-            reason=f"Score changed {seconds:.0f}s ago. Event-driven repricing{extra}.",
-            trade_action=f"FOLLOW the move. Buy the player whose odds touched the {s.touch} band.",
-            confidence=conf,
-            details={
-                "seconds_since_score_change": round(seconds, 1),
-                "touch_distance": round(dist, 4),
-                "high_vol": high_vol,
-            },
-        )
-
-    return Signal(
-        case_id="C2_SCORE_DRIVEN",
-        direction="fade",
-        title=f"{s.touch.upper()} TOUCH — NO RECENT SCORE CHANGE",
-        reason=f"Score unchanged for {seconds:.0f}s but odds touched a band.",
-        trade_action=f"FADE. Buy the OPPOSITE side of the {s.touch} touch.",
-        confidence="MEDIUM",
-        details={
-            "seconds_since_score_change": round(seconds, 1),
-            "touch_distance": round(dist, 4),
-        },
-    )
+        return Signal(case_id="C2_SCORE_DRIVEN", direction="follow",
+                      title=f"{s.touch.upper()} TOUCH — REAL SCORE MOVE",
+                      reason=f"Score changed {seconds:.0f}s ago. Event-driven repricing{extra}.",
+                      trade_action=f"FOLLOW the move. Buy the player whose odds touched the {s.touch} band.",
+                      confidence=conf,
+                      details={"seconds_since_score_change": round(seconds, 1),
+                               "touch_distance": round(dist, 4), "high_vol": high_vol})
+    return Signal(case_id="C2_SCORE_DRIVEN", direction="fade",
+                  title=f"{s.touch.upper()} TOUCH — NO RECENT SCORE CHANGE",
+                  reason=f"Score unchanged for {seconds:.0f}s but odds touched a band.",
+                  trade_action=f"FADE. Buy the OPPOSITE side of the {s.touch} touch.",
+                  confidence="MEDIUM",
+                  details={"seconds_since_score_change": round(seconds, 1),
+                           "touch_distance": round(dist, 4)})
 
 
 def case_3_timebreak(s: MarketSnapshot) -> Optional[Signal]:
     if s.touch is None or s.last_point_time is None:
         return None
-
     gap = (datetime.now() - s.last_point_time).total_seconds()
     if gap >= CHANGEOVER_THRESHOLD_S:
-        return Signal(
-            case_id="C3_TIMEBREAK_NOISE",
-            direction="fade",
-            title="BAND TOUCH DURING CHANGEOVER",
-            reason=f"No point for {gap:.0f}s. Band touches here are noise.",
-            trade_action="DO NOT CHASE. Wait for play to resume.",
-            confidence="HIGH",
-            details={"gap_seconds": round(gap, 1)},
-        )
+        return Signal(case_id="C3_TIMEBREAK_NOISE", direction="fade",
+                      title="BAND TOUCH DURING CHANGEOVER",
+                      reason=f"No point for {gap:.0f}s. Band touches here are noise.",
+                      trade_action="DO NOT CHASE. Wait for play to resume.",
+                      confidence="HIGH", details={"gap_seconds": round(gap, 1)})
     return None
 
 
 def case_4_volatility(s: MarketSnapshot) -> Optional[Signal]:
     if s.touch is None or len(s.recent_prices) < BOLLINGER_PERIOD:
         return None
-
     tail = pd.Series(s.recent_prices[-BOLLINGER_PERIOD:])
     q1, q3 = float(tail.quantile(0.25)), float(tail.quantile(0.75))
     iqr = q3 - q1
-
     if iqr < MIN_IQR:
         return None
-
     dist = _touch_distance(s)
     details = {"iqr": round(iqr, 4)}
     if dist is not None:
         details["touch_distance"] = round(dist, 4)
-
     if iqr >= VOL_HIGH_IQR:
-        return Signal(
-            case_id="C4_VOLATILITY_ADJUSTED",
-            direction="info",
-            title=f"{s.touch.upper()} TOUCH IN HIGH-VOL REGIME",
-            reason=f"IQR={iqr:.4f} (high). Bands too noisy.",
-            trade_action="IGNORE unless confirmed by C1, C2 or C5.",
-            confidence="LOW",
-            details={**details, "regime": "high"},
-        )
-
+        return Signal(case_id="C4_VOLATILITY_ADJUSTED", direction="info",
+                      title=f"{s.touch.upper()} TOUCH IN HIGH-VOL REGIME",
+                      reason=f"IQR={iqr:.4f} (high). Bands too noisy.",
+                      trade_action="IGNORE unless confirmed by C1, C2 or C5.",
+                      confidence="LOW", details={**details, "regime": "high"})
     if iqr <= VOL_LOW_IQR:
         seconds = _seconds_since_score(s)
         recently_active = seconds is not None and seconds <= C4_RECENT_ACTIVITY_WINDOW_S
-
         if not recently_active:
-            return Signal(
-                case_id="C4_VOLATILITY_ADJUSTED",
-                direction="info",
-                title=f"{s.touch.upper()} TOUCH IN LOW-VOL (STALE)",
-                reason=f"IQR={iqr:.4f} low but no recent score activity. Quiet market — touch is likely noise.",
-                trade_action="IGNORE — no score context to justify FOLLOW.",
-                confidence="LOW",
-                details={**details, "regime": "low-stale"},
-            )
-
-        return Signal(
-            case_id="C4_VOLATILITY_ADJUSTED",
-            direction="follow",
-            title=f"{s.touch.upper()} TOUCH IN LOW-VOL REGIME",
-            reason=f"IQR={iqr:.4f} (low) + recent score activity. Band touch is meaningful.",
-            trade_action=f"FOLLOW. Buy the {s.touch} band touch side.",
-            confidence="MEDIUM",
-            details={**details, "regime": "low-active"},
-        )
-
+            return Signal(case_id="C4_VOLATILITY_ADJUSTED", direction="info",
+                          title=f"{s.touch.upper()} TOUCH IN LOW-VOL (STALE)",
+                          reason=f"IQR={iqr:.4f} low but no recent score activity. Quiet market — touch is likely noise.",
+                          trade_action="IGNORE — no score context to justify FOLLOW.",
+                          confidence="LOW", details={**details, "regime": "low-stale"})
+        return Signal(case_id="C4_VOLATILITY_ADJUSTED", direction="follow",
+                      title=f"{s.touch.upper()} TOUCH IN LOW-VOL REGIME",
+                      reason=f"IQR={iqr:.4f} (low) + recent score activity. Band touch is meaningful.",
+                      trade_action=f"FOLLOW. Buy the {s.touch} band touch side.",
+                      confidence="MEDIUM", details={**details, "regime": "low-active"})
     return None
 
 
 def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
     if s.markov_fair_prob is None or s.touch is None:
         return None
-
     seconds = _seconds_since_score(s)
     if seconds is None or seconds > POLL_INTERVAL_SECONDS * 1.5:
         return None
-
     dist = _touch_distance(s)
     if dist is None or dist < 0.006:
         return None
-
     if s.last_point_time is not None:
         gap = (datetime.now() - s.last_point_time).total_seconds()
         if gap >= CHANGEOVER_THRESHOLD_S:
             return None
-
     divergence = s.current_price - s.markov_fair_prob
     high_vol = _is_high_vol(s)
     role = _get_current_role(s)
-
     details = {
         "divergence": round(divergence, 4),
         "markov_fair": round(s.markov_fair_prob, 4),
@@ -663,73 +588,51 @@ def case_5_markov(s: MarketSnapshot) -> Optional[Signal]:
         "seconds_since_score": round(seconds, 1),
         "role": role,
     }
-
     threshold = MARKOV_DIVERGENCE * (1.15 if high_vol else 1.0)
-
     if s.touch == "upper" and divergence > threshold:
         conf = "HIGH" if abs(divergence) >= threshold * 1.3 else "MEDIUM"
         if high_vol and conf == "HIGH":
             conf = "MEDIUM"
-
-        return Signal(
-            case_id="C5_MARKOV_FAIRVALUE",
-            direction="fade",
-            title="UPPER TOUCH ABOVE MARKOV FAIR VALUE",
-            reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} (+{divergence:.3f}) after recent score change.",
-            trade_action="FADE. Buy the opposite outcome.",
-            confidence=conf,
-            details=details,
-        )
-
+        return Signal(case_id="C5_MARKOV_FAIRVALUE", direction="fade",
+                      title="UPPER TOUCH ABOVE MARKOV FAIR VALUE",
+                      reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} (+{divergence:.3f}) after recent score change.",
+                      trade_action="FADE. Buy the opposite outcome.",
+                      confidence=conf, details=details)
     if s.touch == "lower" and -divergence > threshold:
         conf = "HIGH" if abs(divergence) >= threshold * 1.3 else "MEDIUM"
         if high_vol and conf == "HIGH":
             conf = "MEDIUM"
-
-        return Signal(
-            case_id="C5_MARKOV_FAIRVALUE",
-            direction="fade",
-            title="LOWER TOUCH BELOW MARKOV FAIR VALUE",
-            reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} ({divergence:.3f}) after recent score change.",
-            trade_action="FADE. Buy the underpriced side.",
-            confidence=conf,
-            details=details,
-        )
-
+        return Signal(case_id="C5_MARKOV_FAIRVALUE", direction="fade",
+                      title="LOWER TOUCH BELOW MARKOV FAIR VALUE",
+                      reason=f"Market {s.current_price:.3f} vs Markov {s.markov_fair_prob:.3f} ({divergence:.3f}) after recent score change.",
+                      trade_action="FADE. Buy the underpriced side.",
+                      confidence=conf, details=details)
     return None
 
 
 def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
     if s.touch is None:
         return None
-
     role = _get_current_role(s)
     if role == "unknown":
         return None
-
     if s.last_score_change_ts is None:
         return None
     seconds_since_score = (datetime.now() - s.last_score_change_ts).total_seconds()
     if seconds_since_score > POLL_INTERVAL_SECONDS * 1.5:
         return None
-
     if s.last_point_time is not None:
         gap = (datetime.now() - s.last_point_time).total_seconds()
         if gap >= CHANGEOVER_THRESHOLD_S:
             return None
-
     dist = _touch_distance(s)
     if dist is None or dist < 0.006:
         return None
-
     is_favorite_dip = (role == "favorite" and s.touch == "lower")
     is_underdog_spike = (role == "underdog" and s.touch == "upper")
-
     if not (is_favorite_dip or is_underdog_spike):
         return None
-
     high_vol = _is_high_vol(s)
-
     confidence = "MEDIUM"
     details = {
         "role": role,
@@ -737,24 +640,20 @@ def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
         "touch_distance": round(dist, 4),
         "seconds_since_score": round(seconds_since_score, 1),
     }
-
     if s.markov_fair_prob is not None:
         markov_div = s.markov_fair_prob - s.current_price
         details["markov_fair"] = round(s.markov_fair_prob, 4)
         details["markov_div"] = round(markov_div, 4)
         if abs(markov_div) >= MARKOV_DIVERGENCE:
             confidence = "HIGH"
-
     if is_favorite_dip and s.current_price >= 0.62:
         confidence = "HIGH"
     if is_underdog_spike and s.current_price <= 0.38:
         confidence = "HIGH"
-
     if high_vol and confidence == "HIGH":
         confidence = "MEDIUM"
     elif high_vol:
         details["vol_regime"] = "high"
-
     if is_favorite_dip:
         title = "FAVORITE HIT LOWER BAND"
         reason = (
@@ -771,7 +670,6 @@ def case_6_favorite_longshot(s: MarketSnapshot) -> Optional[Signal]:
             "Market over-valuing a short run."
         )
         trade_action = "FADE. Buy the FAVORITE — underdog overpriced."
-
     return Signal(
         case_id="C6_FAVORITE_LONGSHOT",
         direction="fade",
@@ -821,26 +719,21 @@ def discover_tennis_markets_all() -> List[Dict[str, Any]]:
         )
         for m in all_markets:
             text = f"{m.question} {m.slug}".lower()
-
-            # Skip doubles
             if "doubles" in text or "double" in text:
                 continue
-
             tour = None
             if "atp" in text or "masters" in text or "1000" in text or "finals" in text:
                 tour = "ATP"
             elif "wta" in text:
                 tour = "WTA"
-
             if tour is None:
                 continue
-
             out.append({"market": m, "tour": tour})
     return out
 
 
 # ============================================================================
-# FAVORITE / UNDERDOG + NTFY
+# FAVORITE / UNDERDOG + NTFY HELPERS
 # ============================================================================
 
 def _identify_favorite_underdog(
@@ -849,7 +742,6 @@ def _identify_favorite_underdog(
     outcomes = list(s.outcomes or [])
     if len(outcomes) != 2:
         return None, None
-
     p0 = p1 = None
     if isinstance(s.current_price, (int, float)):
         try:
@@ -857,13 +749,10 @@ def _identify_favorite_underdog(
             p1 = 1.0 - p0
         except Exception:
             pass
-
     if s.role == "underdog" and p0 is not None and p1 is not None and p0 > p1:
         p0, p1 = p1, p0
-
     if p0 is None or p1 is None:
         return None, None
-
     if p0 >= p1:
         return outcomes[0], outcomes[1]
     return outcomes[1], outcomes[0]
@@ -873,64 +762,51 @@ def _discreet_role_tag(s: MarketSnapshot) -> str:
     fav, dog = _identify_favorite_underdog(s)
     if not fav or not dog:
         return ""
-
     def _short(name: str, limit: int = 22) -> str:
         name = str(name).strip()
         return name if len(name) <= limit else name[:limit-1] + "…"
-
     return f"fav: {_short(fav)} | dog: {_short(dog)}"
 
 
-DIRECTION_ICON = {"fade": "🟡 FADE", "follow": "🟢 FOLLOW", "info": "ℹ️ INFO"}
-DIRECTION_TAG = {"fade": "warning", "follow": "white_check_mark", "info": "information_source"}
-DIRECTION_PRIORITY = {"fade": "high", "follow": "high", "info": "default"}
+def format_band_touch_ntfy(s: MarketSnapshot, c6_signal: Optional[Signal] = None) -> Tuple[str, str]:
+    """Build a clean ntfy message for a band touch."""
+    fav, dog = _identify_favorite_underdog(s)
+    role_line = _discreet_role_tag(s)
 
+    touch_emoji = "🔴" if s.touch == "upper" else "🔵"
+    title = f"{touch_emoji} BAND TOUCH — {s.tour} — {s.touch.upper()}"
 
-def format_ntfy_body(sig: Signal, s: MarketSnapshot) -> str:
     lines = [
-        f"Tour:    {s.tour}",
-        f"Market:  {s.question}",
-        f"Score:   {s.score_line}",
-        f"Server:  {s.server or 'N/A'}   Role: {s.role}",
+        f"Tour:     {s.tour}",
+        f"Match:    {s.question}",
+        f"Score:    {s.score_line or 'N/A'}",
+        f"Server:   {s.server or 'N/A'}",
         "",
-        f"Price:   {s.current_price:.4f}",
-        f"Touch:   {s.touch}",
+        f"Price:    {s.current_price:.4f}",
+        f"Touch:    {s.touch.upper()} BAND",
     ]
     if s.bands:
+        lines.append(
+            f"Bands:    up={s.bands['upper']:.4f}  mid={s.bands['middle']:.4f}  lo={s.bands['lower']:.4f}"
+        )
+    if role_line:
+        lines += ["", f"Roles:    {role_line}"]
+
+    # C6 information
+    if c6_signal:
         lines += [
-            f"Bands:   up={s.bands['upper']:.4f}  "
-            f"mid={s.bands['middle']:.4f}  lo={s.bands['lower']:.4f}",
+            "",
+            ">>> C6 FAVORITE/LONGSHOT TRIGGERED <<<",
+            f"C6 Title:   {c6_signal.title}",
+            f"C6 Action:  {c6_signal.trade_action}",
+            f"C6 Conf:    {c6_signal.confidence}",
         ]
-    lines += [
-        "",
-        f"Reason:  {sig.reason}",
-        f"Action:  {sig.trade_action}",
-        f"Confidence: {sig.confidence}",
-    ]
-    if sig.details:
-        lines += ["", f"Details: {sig.details}"]
+    else:
+        lines += ["", "C6:        not triggered"]
+
     lines += ["", f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
-    return "\n".join(lines)
-
-
-def format_ntfy_body_with_roles(sig: Signal, s: MarketSnapshot) -> str:
-    base = format_ntfy_body(sig, s)
-    tag = _discreet_role_tag(s)
-    if not tag:
-        return base
-
-    lines = base.split("\n")
-    insert_at = len(lines)
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].startswith("Time:"):
-            insert_at = i
-            break
-
-    lines.insert(insert_at, f"Roles:   {tag}")
-    if insert_at < len(lines) - 1 and lines[insert_at - 1] != "":
-        lines.insert(insert_at, "")
-
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return title, body
 
 
 # ============================================================================
@@ -957,42 +833,32 @@ class TennisBollingerScanner:
         if not key:
             raise ValueError("LIVETENNIS_API_KEY not set.")
         self.live_client = LiveTennisClient(api_key=key)
-        print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only, SINGLES only). "
-              f"Cases: {sorted(ENABLED_CASES)}")
+        print(f"[{datetime.now()}] Signal Engine initialized (LIVE-only, SINGLES only).")
+        print(f"[{datetime.now()}] ntfy mode: BAND TOUCH only (+ C6 note)")
         print(f"[{datetime.now()}] relay URL: {PA_RELAY_URL}")
         print(f"[{datetime.now()}] poll interval: {POLL_INTERVAL_SECONDS}s  "
-              f"live cache: {LIVE_MATCHES_CACHE_SECONDS}s  "
-              f"view cache: {VIEW_CACHE_SECONDS}s")
-        cd_summary = ", ".join(
-            f"{k.split('_')[0]}={v}s" for k, v in CASE_SPECIFIC_COOLDOWN.items()
-        )
-        print(f"[{datetime.now()}] per-case cooldowns: {cd_summary}")
+              f"live cache: {LIVE_MATCHES_CACHE_SECONDS}s")
 
     def _get_live_matches(self, force: bool = False) -> List:
         now = datetime.now()
-
         use_cache = (
             not force
             and self._live_matches_ts is not None
             and (now - self._live_matches_ts).total_seconds() < LIVE_MATCHES_CACHE_SECONDS
             and len(self._live_matches_cache) > 0
         )
-
         if use_cache:
             age = (now - self._live_matches_ts).total_seconds()
             print(f"  [match] using cached live list "
                   f"({len(self._live_matches_cache)} matches, age {age:.0f}s)")
             return self._live_matches_cache
-
         try:
             fresh = self.live_client.live_matches()
             self._live_matches_cache = fresh if fresh is not None else []
             self._live_matches_ts = now
-            print(f"  [match] fetched {len(self._live_matches_cache)} live "
-                  f"matches from Live Tennis API")
+            print(f"  [match] fetched {len(self._live_matches_cache)} live matches")
         except Exception as e:
             print(f"  ! live_matches() failed: {e}")
-
         return self._live_matches_cache
 
     def _get_view(self, market, match):
@@ -1003,78 +869,56 @@ class TennisBollingerScanner:
             ts, view = cached
             if (now - ts).total_seconds() < VIEW_CACHE_SECONDS:
                 return view
-
         try:
             view = build_view(market, match)
         except Exception as e:
             print(f"  ! build_view error for {slug}: {e}")
             view = None
-
         self._view_cache[slug] = (now, view)
         return view
 
-    def cooldown_key(self, slug: str, case_id: str) -> str:
-        return f"{slug}::{case_id}"
-
-    def cooldown_seconds_for(self, case_id: str) -> int:
-        return CASE_SPECIFIC_COOLDOWN.get(case_id, DEFAULT_ALERT_COOLDOWN_SECONDS)
-
-    def cooldown_ok(self, key: str, case_id: str) -> bool:
+    def cooldown_ok_band(self, slug: str) -> bool:
+        key = f"{slug}::BAND_TOUCH"
         st = self.alert_state.get(key)
         if st is None or st.last_alert_time is None:
             return True
         elapsed = (datetime.now() - st.last_alert_time).total_seconds()
-        return elapsed >= self.cooldown_seconds_for(case_id)
+        return elapsed >= BAND_TOUCH_COOLDOWN_SECONDS
 
-    def record_alert(self, key: str, kind: str):
+    def record_band_alert(self, slug: str):
+        key = f"{slug}::BAND_TOUCH"
         self.alert_state[key] = MarketAlert(
-            market_slug=key, last_alert_time=datetime.now(),
-            last_alert_type=kind,
+            market_slug=key,
+            last_alert_time=datetime.now(),
+            last_alert_type="BAND_TOUCH",
         )
 
-    def fire(self, slug: str, sig: Signal, s: MarketSnapshot):
-        key = self.cooldown_key(slug, sig.case_id)
-        if not self.cooldown_ok(key, sig.case_id):
+    def send_band_touch_alert(self, s: MarketSnapshot, c6_signal: Optional[Signal]):
+        """Only place that sends ntfy messages."""
+        if not self.cooldown_ok_band(s.market_slug):
+            print(f"  [ntfy] cooldown active for {s.market_slug}, skipping")
             return
 
-        bar = "=" * 68
-        icon = DIRECTION_ICON[sig.direction]
-        print(f"\n{bar}")
-        print(f"  {sig.case_id} [{sig.confidence}]")
-        print(f"  {icon} — {sig.title}")
-        print(bar)
-        print(f"  Market:    {s.question}")
-        print(f"  Tour:      {s.tour}")
-        print(f"  Score:     {s.score_line}")
-        print(f"  Server:    {s.server or 'N/A'}   Role: {s.role}")
-        print(f"  Price:     {s.current_price:.4f}   Touch: {s.touch}")
-        if s.bands:
-            print(f"  Bands:     up={s.bands['upper']:.4f}  "
-                  f"mid={s.bands['middle']:.4f}  lo={s.bands['lower']:.4f}")
-        print(f"  Reason:    {sig.reason}")
-        print(f"  ACTION:    {sig.trade_action}")
-        if sig.details:
-            print(f"  Details:   {sig.details}")
-        print(f"  Cooldown:  {self.cooldown_seconds_for(sig.case_id)}s")
+        title, body = format_band_touch_ntfy(s, c6_signal)
 
-        role_tag = _discreet_role_tag(s)
-        if role_tag:
-            print(f"  Roles:     {role_tag}")
-        print(f"{bar}\n")
+        print("\n" + "=" * 68)
+        print(f"  BAND TOUCH ALERT → ntfy")
+        print(f"  {title}")
+        print("=" * 68)
+        print(body)
+        print("=" * 68 + "\n")
 
-        title = f"{icon} {sig.case_id} — {s.tour}"
-        body = format_ntfy_body_with_roles(sig, s)
-        tags = DIRECTION_TAG.get(sig.direction, "")
-        priority = DIRECTION_PRIORITY.get(sig.direction, "default")
+        ok = RELAY.send(
+            title=title,
+            body=body,
+            priority="high",
+            tags="chart_with_upwards_trend" if s.touch == "upper" else "chart_with_downwards_trend",
+        )
 
-        ok = RELAY.send(title=title, body=body, priority=priority, tags=tags)
-
-        if not ok:
-            print(f"  ! relay delivery failed for {sig.case_id} — "
-                  f"cooldown NOT recorded, will retry next cycle")
-            return
-
-        self.record_alert(key, sig.case_id)
+        if ok:
+            self.record_band_alert(s.market_slug)
+        else:
+            print(f"  ! relay delivery failed for band touch — will retry next cycle")
 
     def build_snapshot(self, item) -> Optional[MarketSnapshot]:
         market = item["market"]
@@ -1121,7 +965,7 @@ class TennisBollingerScanner:
             band_width_pct = (up - lo) / mid * 100.0 if mid else 0.0
             touch_tag = touch if touch else "-"
             print(
-                f"  \' {slug[:45]:<45}  "
+                f"  \'' {slug[:45]:<45}  "
                 f"px={px:.4f}  "
                 f"to_up={dist_up_pct:+.2f}%  "
                 f"to_lo={dist_lo_pct:+.2f}%  "
@@ -1139,10 +983,8 @@ class TennisBollingerScanner:
         if view is not None:
             score_line = getattr(view, "score_line", "") or ""
             bp_flag = bool(getattr(view, "break_point", False))
-
             server_raw = getattr(view, "server", None)
             outcomes = list(getattr(market, "outcomes", []) or [])
-
             if isinstance(server_raw, int) and 0 <= server_raw < len(outcomes):
                 server = outcomes[server_raw]
             elif isinstance(server_raw, str):
@@ -1152,9 +994,6 @@ class TennisBollingerScanner:
                         server = outcomes[idx]
                 else:
                     server = server_raw
-            else:
-                server = None
-
             if server and len(outcomes) == 2:
                 receiver = outcomes[1] if outcomes[0] == server else outcomes[0]
 
@@ -1204,12 +1043,10 @@ class TennisBollingerScanner:
 
     def match_markets_to_live(self, discovered) -> List:
         live = self._get_live_matches()
-
         if len(live) == 0:
             print("  [match] empty live list → forcing refresh")
             live = self._get_live_matches(force=True)
 
-        # Keep only singles
         singles = []
         for m in live:
             if isinstance(m, dict):
@@ -1223,24 +1060,24 @@ class TennisBollingerScanner:
 
         print(f"  [match] LiveTennis: {len(live)} total → {len(singles)} singles")
 
-        # Better debug print
         for m in singles[:8]:
             if isinstance(m, dict):
-                players = m.get("players")
-                if isinstance(players, list) and len(players) >= 2:
-                    p1 = players[0].get("name") if isinstance(players[0], dict) else str(players[0])
-                    p2 = players[1].get("name") if isinstance(players[1], dict) else str(players[1])
-                    name = f"{p1} vs {p2}"
-                else:
-                    name = str(players)[:80] if players else "?"
-                tour = m.get("tour") or m.get("tournament") or "?"
-                print(f"    • [{tour}] {name}")
+                players = m.get("players") or {}
+                p1 = p2 = "?"
+                if isinstance(players, dict):
+                    p1_data = players.get("p1") or players.get("player1") or {}
+                    p2_data = players.get("p2") or players.get("player2") or {}
+                    if isinstance(p1_data, dict):
+                        p1 = p1_data.get("name") or p1_data.get("full_name") or str(p1_data)[:40]
+                    if isinstance(p2_data, dict):
+                        p2 = p2_data.get("name") or p2_data.get("full_name") or str(p2_data)[:40]
+                tour = m.get("tour") or m.get("tournament") or m.get("tier") or "?"
+                print(f"    • [{tour}] {p1} vs {p2}")
             else:
                 print(f"    • {m}")
 
         paired = []
         unmatched = 0
-
         for entry in discovered:
             m = entry["market"]
             tour = entry["tour"]
@@ -1280,9 +1117,21 @@ class TennisBollingerScanner:
                 continue
             if self.scan_count < 2:
                 continue
+
+            # Only act when there is a band touch
+            if s.touch is None:
+                continue
+
+            # Run cases only to detect C6 (and for console logging if desired)
             signals = run_all_cases(s)
+            c6_signal = None
             for sig in signals:
-                self.fire(s.market_slug, sig, s)
+                if sig.case_id == "C6_FAVORITE_LONGSHOT":
+                    c6_signal = sig
+                    break
+
+            # Send the single band-touch ntfy
+            self.send_band_touch_alert(s, c6_signal)
 
     def run(self):
         self.initialize()
@@ -1331,7 +1180,7 @@ def _start_scanner_once():
 @app.route("/")
 def root():
     _start_scanner_once()
-    return "Tennis scanner is running (singles only)", 200
+    return "Tennis scanner is running (band-touch ntfy only)", 200
 
 
 @app.route("/scanner-status")
