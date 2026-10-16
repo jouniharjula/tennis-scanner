@@ -2766,7 +2766,7 @@ from eth_account import Account
 MARKET_BIAS = 1
 
 NUM_ORDERS = 1
-TP_OFF = 0.01
+TP_OFF = 0.03
 
 # -------- Venue enable flags --------
 ASTER_ENABLED   = True
