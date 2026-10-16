@@ -1,6 +1,5 @@
-polymarket-tennis
-vibe-trading-livetennis
 pandas
 flask
 gunicorn
 requests>=2.31.0
+eth-account
