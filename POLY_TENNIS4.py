@@ -513,7 +513,8 @@ class RelayClient:
             time.sleep(self._min_gap_sec - delta)
 
     def send(self, title: str, body: str, priority: str = "default",
-             tags: str = "") -> bool:
+             tags: str = "", target: str = "ntfy") -> bool:
+        """target: 'ntfy' (default) or 'discord' — same PA endpoint."""
         self._wait_for_slot()
 
         payload = json.dumps({
@@ -521,6 +522,7 @@ class RelayClient:
             "body": body,
             "priority": priority,
             "tags": tags,
+            "target": target,
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2862,27 +2864,26 @@ _last_discord_send = 0.0
 
 
 def send_discord_message(content):
+    """Send Discord notification via the same PA relay (target=discord)."""
     global _last_discord_send
-    if not DISCORD_WEBHOOK_URL:
+    if not content:
         return
     delta = time.time() - _last_discord_send
     if delta < DISCORD_RATE_LIMIT_DELAY:
         time.sleep(DISCORD_RATE_LIMIT_DELAY - delta)
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=8)
+        ok = RELAY.send(
+            title="Trade Map",
+            body=_sanitize_ascii(content),
+            priority="default",
+            tags="discord",
+            target="discord",
+        )
         _last_discord_send = time.time()
-        if r.status_code == 429:
-            retry_after = 5.0
-            try:
-                retry_after = float(r.json().get("retry_after", 5))
-            except Exception:
-                pass
-            time.sleep(retry_after)
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=8)
-        elif r.status_code not in (200, 204):
-            print(f"  ⚠️ Discord HTTP {r.status_code}: {r.text[:200]}")
+        if not ok:
+            print("  ⚠️ Discord relay delivery failed")
     except Exception as e:
-        print(f"  ⚠️ Discord send error: {e}")
+        print(f"  ⚠️ Discord relay error: {e}")
 
 
 # ============================================================================
