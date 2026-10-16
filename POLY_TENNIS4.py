@@ -2763,7 +2763,7 @@ from eth_account import Account
 # 0 = BEARISH  -> only UPPER band + MO trades allowed
 # 1 = BULLISH  -> only LOWER band + MU trades allowed
 # 2 = NEUTRAL  -> both directions allowed
-MARKET_BIAS = 1
+MARKET_BIAS = 0
 
 NUM_ORDERS = 1
 TP_OFF = 0.03
