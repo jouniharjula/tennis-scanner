@@ -36,6 +36,10 @@ import random
 import itertools
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Callable
+import urllib.request
+import urllib.error
+from flask import Flask
+
 
 # ==============================================================================
 # MODIFICATION FLAGS
