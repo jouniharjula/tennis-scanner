@@ -72,6 +72,14 @@ NTFY_INTER_COIN_DELAY = 1.5
 NTFY_MAX_ATTEMPTS = 3
 NTFY_CIRCUIT_BREAKER_THRESHOLD = 300.0
 
+# ============================================================================
+# RELAY CONFIGURATION (exact same as TENNIS.py — same PA webapp)
+# ============================================================================
+PA_RELAY_URL = os.environ.get(
+    "PA_RELAY_URL",
+    "https://jharjula.pythonanywhere.com/relay",
+)
+
 # ==============================================================================
 # SYSTEM PROFILES — the core of the dual-system design
 # ==============================================================================
@@ -490,6 +498,62 @@ _ntfy_circuit_open = False
 _ntfy_send_lock = threading.Lock()
 
 
+# ============================================================================
+# RELAY CLIENT (exact same as TENNIS.py — same PA webapp)
+# ============================================================================
+class RelayClient:
+    def __init__(self, relay_url: str):
+        self.relay_url = relay_url
+        self._last_send_ts = 0.0
+        self._min_gap_sec = 2.0
+
+    def _wait_for_slot(self):
+        delta = time.monotonic() - self._last_send_ts
+        if delta < self._min_gap_sec:
+            time.sleep(self._min_gap_sec - delta)
+
+    def send(self, title: str, body: str, priority: str = "default",
+             tags: str = "") -> bool:
+        self._wait_for_slot()
+
+        payload = json.dumps({
+            "title": title,
+            "body": body,
+            "priority": priority,
+            "tags": tags,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            self.relay_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "tennis-scanner/1.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status = resp.status
+                preview = resp.read(200).decode("utf-8", "ignore")
+                print(f"  [relay] PA responded {status}: {preview[:120]}")
+                self._last_send_ts = time.monotonic()
+                return 200 <= status < 300
+        except urllib.error.HTTPError as e:
+            preview = e.read(300).decode("utf-8", "ignore")
+            print(f"  [relay] PA HTTP {e.code}: {e.reason} — {preview}")
+            self._last_send_ts = time.monotonic()
+            return False
+        except Exception as e:
+            print(f"  [relay] PA error: {e}")
+            self._last_send_ts = time.monotonic()
+            return False
+
+
+RELAY = RelayClient(PA_RELAY_URL)
+
+
 def _ntfy_throttle():
     global _ntfy_last_post_ts
     now = time.time()
@@ -516,54 +580,38 @@ def _sanitize_ascii(text):
 
 
 def _ntfy_post_send(title, text, priority="default", tags=None, force=False):
+    """
+    Deliver via PythonAnywhere relay (same endpoint / payload shape as TENNIS.py).
+    """
     if _QUIET_MODE and not force:
         return None
     global _ntfy_circuit_open
-    if not NTFY_TOPIC or NTFY_TOPIC.startswith("trademap-CHANGE-ME"):
-        _quiet_print("  [ERR] ntfy not configured")
-        return None
     if _ntfy_circuit_open:
         _quiet_print("  [SKIP] ntfy circuit open")
         return None
 
-    url = f"{NTFY_BASE_URL.rstrip('/')}/{NTFY_TOPIC}"
-    auth = (NTFY_USERNAME, NTFY_PASSWORD) if (NTFY_USERNAME and NTFY_PASSWORD) else None
-    headers = {
-        "Title": _sanitize_ascii(title or "Trade Map"),
-        "Priority": priority,
-        "Tags": _sanitize_ascii(",".join(tags) if tags else ""),
-        "Content-Type": "text/plain; charset=utf-8",
-    }
-    body = _sanitize_ascii(text or "").encode("ascii", "ignore")
+    clean_title = _sanitize_ascii(title or "Trade Map")
+    clean_body = _sanitize_ascii(text or "")
+    if isinstance(tags, (list, tuple)):
+        tags_str = _sanitize_ascii(",".join(str(t) for t in tags if t))
+    else:
+        tags_str = _sanitize_ascii(tags or "")
 
-    for attempt in range(1, NTFY_MAX_ATTEMPTS + 1):
+    try:
         _ntfy_throttle()
-        try:
-            r = requests.post(url, data=body, headers=headers, auth=auth, timeout=20)
-        except Exception as e:
-            _quiet_print(f"  [ERR] ntfy POST: {e}")
-            time.sleep(2.0 * attempt)
-            continue
-        if r.status_code in (200, 201, 202):
-            return r
-        if r.status_code == 429:
-            retry_after = 5.0
-            try:
-                ra = r.headers.get("Retry-After")
-                if ra is not None:
-                    retry_after = float(ra)
-            except Exception:
-                pass
-            if retry_after > NTFY_CIRCUIT_BREAKER_THRESHOLD:
-                _ntfy_circuit_open = True
-                return r
-            time.sleep(min(retry_after + 1.0, 60.0))
-            continue
-        if 500 <= r.status_code < 600:
-            time.sleep(2.0 * attempt)
-            continue
-        return r
-    return None
+        ok = RELAY.send(
+            title=clean_title,
+            body=clean_body,
+            priority=priority or "default",
+            tags=tags_str,
+        )
+        if ok:
+            return True
+        _quiet_print("  [relay] delivery failed — will not open circuit (retry next cycle)")
+        return None
+    except Exception as e:
+        _quiet_print(f"  [relay] unexpected error: {e}")
+        return None
 
 
 def send_ntfy_message(content, title="Trade Map", priority="default", tags=None,
@@ -2824,7 +2872,12 @@ def send_discord_message(content):
         r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=8)
         _last_discord_send = time.time()
         if r.status_code == 429:
-            time.sleep(float(r.json().get("retry_after", 5)))
+            retry_after = 5.0
+            try:
+                retry_after = float(r.json().get("retry_after", 5))
+            except Exception:
+                pass
+            time.sleep(retry_after)
             requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=8)
         elif r.status_code not in (200, 204):
             print(f"  ⚠️ Discord HTTP {r.status_code}: {r.text[:200]}")
