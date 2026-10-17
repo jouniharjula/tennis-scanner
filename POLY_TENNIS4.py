@@ -2700,6 +2700,203 @@ def _tm_comp_monitor_worker():
 
 
 # ==============================================================================
+# LIVE BB WICK ALERT WORKER  (integrated from WORKER.py)
+# ==============================================================================
+# Monitors the CURRENTLY-FORMING 4H candle for a touch of the upper/lower
+# Bollinger Band (BB_PERIOD=20, BB_STD=2.0, computed from CLOSED candles).
+# Fires to Discord via the same PA relay as send_discord_message().
+# Independent thread — does NOT interfere with any main-script scan logic.
+# ==============================================================================
+
+WORKER_ALERT_ENABLED        = True
+WORKER_ALERT_TIMEFRAME      = 60         # 4H in minutes
+WORKER_ALERT_BB_PERIOD      = 20
+WORKER_ALERT_BB_STD         = 2.0
+WORKER_ALERT_WICK_THRESHOLD = 0.4          # informational only (last closed candle)
+WORKER_ALERT_COOLDOWN       = 6000         # 100 min per pair / per side
+WORKER_ALERT_CHECK_INTERVAL = 400          # 400s between poll cycles
+WORKER_ALERT_LOOKBACK_DAYS  = 60
+
+WORKER_ALERT_PAIRS = {
+    "XXBTZUSD": "BTC/USD",
+    "XETHZUSD": "ETH/USD",
+    "XXMRZUSD": "XMR/USD",
+}
+
+_worker_alert_last_ts: Dict[str, float] = {}          # key = "{pair}_{side}"
+_worker_alert_last_live_candle: Dict[str, int] = {}   # key = "{pair}_{side}"
+_worker_alert_verified_pairs: Dict[str, str] = {}     # filled on startup
+
+
+def _worker_alert_bb(candles, period=WORKER_ALERT_BB_PERIOD,
+                     std_dev=WORKER_ALERT_BB_STD):
+    if len(candles) < period:
+        return None, None, None
+    closes = [c["close"] for c in candles[-period:]]
+    sma = sum(closes) / period
+    var = sum((x - sma) ** 2 for x in closes) / period
+    std = var ** 0.5
+    return sma + std_dev * std, sma, sma - std_dev * std
+
+
+def _worker_alert_wick_info(candle):
+    o = float(candle["open"]); h = float(candle["high"])
+    l = float(candle["low"]);  c = float(candle["close"])
+    body = abs(c - o)
+    if body == 0:
+        return 1.0, 1.0
+    return (h - max(o, c)) / body, (min(o, c) - l) / body
+
+
+def _worker_alert_verify_pairs():
+    """Ping Kraken once per pair to confirm connectivity; keep working pairs."""
+    global _worker_alert_verified_pairs
+    ok = {}
+    for pair_code, pair_label in WORKER_ALERT_PAIRS.items():
+        _quiet_print(f"  [WORKER-ALERT] testing {pair_code} ({pair_label})...")
+        candles = fetch_kraken_ohlc_bb(
+            pair_code, interval=WORKER_ALERT_TIMEFRAME,
+            limit=WORKER_ALERT_BB_PERIOD + 5,
+        )
+        if candles and len(candles) >= WORKER_ALERT_BB_PERIOD + 1:
+            ok[pair_code] = pair_label
+            _quiet_print(f"    ✅ {pair_code}: {len(candles)} candles")
+        else:
+            _quiet_print(f"    ❌ {pair_code}: insufficient / failed")
+        time.sleep(0.4)
+    _worker_alert_verified_pairs = ok
+    return ok
+
+
+def _worker_alert_send_discord(msg):
+    """Route through the same PA relay path as send_discord_message()."""
+    if not msg:
+        return
+    try:
+        RELAY.send(
+            title="BB Live Touch",
+            body=_sanitize_ascii(msg),
+            priority="high",
+            tags="discord",
+            target="discord",
+        )
+    except Exception as e:
+        print(f"  [WORKER-ALERT] relay error: {e}")
+
+
+def _worker_alert_check_pair(pair_code, pair_name):
+    """
+    Check the forming 4H candle against BBs built from CLOSED candles only.
+    Fires on touch (high >= upper or low <= lower).  Adds a note about the
+    last CLOSED 4H candle's wick status (informational).
+    """
+    try:
+        candles = fetch_kraken_ohlc_bb(
+            pair_code, interval=WORKER_ALERT_TIMEFRAME,
+            limit=max(WORKER_ALERT_BB_PERIOD * 4, 100),
+        )
+        if not candles or len(candles) < WORKER_ALERT_BB_PERIOD + 2:
+            _quiet_print(f"  [WORKER-ALERT] {pair_name}: insufficient candles")
+            return
+
+        closed = candles[:-1]
+        live = candles[-1]
+        last_closed = closed[-1]
+
+        upper_bb, middle_bb, lower_bb = _worker_alert_bb(closed)
+        if upper_bb is None:
+            return
+
+        now = time.time()
+        live_high = float(live["high"])
+        live_low = float(live["low"])
+        live_open = float(live["open"])
+        live_close = float(live["close"])
+        live_time = int(live["time"])
+
+        uw, lw = _worker_alert_wick_info(last_closed)
+        upper_wick_active = uw > WORKER_ALERT_WICK_THRESHOLD
+        lower_wick_active = lw > WORKER_ALERT_WICK_THRESHOLD
+
+        def _emit(side, wick_active, wick_ratio, bb_value):
+            key = f"{pair_code}_{side}"
+            if key in _worker_alert_last_ts and \
+                    (now - _worker_alert_last_ts[key]) <= WORKER_ALERT_COOLDOWN:
+                return
+            if _worker_alert_last_live_candle.get(key) == live_time:
+                return
+
+            wick_note = (
+                f"Last closed 4H {'upper' if side=='upper' else 'lower'} "
+                f"wick: {'ACTIVE' if wick_active else 'not active'} "
+                f"(ratio {wick_ratio:.2f})"
+            )
+            arrow = "🟢 UPPER" if side == "upper" else "🔴 LOWER"
+            msg = (
+                f"🚨 **BB TOUCH: {pair_name}**\n"
+                f"{arrow} Bollinger Band touched on LIVE 4H candle\n"
+                f"```\n"
+                f"Live O: ${live_open:,.2f}  H: ${live_high:,.2f}\n"
+                f"     L: ${live_low:,.2f}  C: ${live_close:,.2f}\n"
+                f"{'Upper' if side=='upper' else 'Lower'} BB: ${bb_value:,.2f}\n"
+                f"Candle: {datetime.fromtimestamp(live_time, tz=timezone.utc):%Y-%m-%d %H:%M UTC} (forming)\n"
+                f"{wick_note}\n"
+                f"```"
+            )
+            print(f"\n[WORKER-ALERT {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}]\n{msg}")
+            _worker_alert_send_discord(msg)
+            _worker_alert_last_ts[key] = now
+            _worker_alert_last_live_candle[key] = live_time
+
+        if live_high >= upper_bb:
+            _emit("upper", upper_wick_active, uw, upper_bb)
+        if live_low <= lower_bb:
+            _emit("lower", lower_wick_active, lw, lower_bb)
+
+    except Exception as e:
+        _quiet_print(f"  [WORKER-ALERT] {pair_name}: {e}")
+
+
+def worker_live_bb_alert_worker():
+    if not WORKER_ALERT_ENABLED:
+        return
+    print("=" * 60)
+    print("LIVE BB TOUCH ALERT WORKER (integrated)")
+    print(f"  Timeframe:     {WORKER_ALERT_TIMEFRAME}m (4H)")
+    print(f"  BB:            {WORKER_ALERT_BB_PERIOD}/{WORKER_ALERT_BB_STD}")
+    print(f"  Cooldown:      {WORKER_ALERT_COOLDOWN // 60} min per pair / side")
+    print(f"  Poll interval: {WORKER_ALERT_CHECK_INTERVAL}s")
+    print(f"  Pairs:         {list(WORKER_ALERT_PAIRS.values())}")
+    print("=" * 60)
+    time.sleep(8)
+    verified = _worker_alert_verify_pairs()
+    if not verified:
+        print("  [WORKER-ALERT] no working pairs — worker idle.")
+        return
+    _worker_alert_send_discord(
+        f"⚙️ **BB Live Touch Alert Worker Started**\n"
+        f"Watching `{', '.join(verified.values())}` on **4H** candles.\n"
+        f"Alerts fire on live-candle band touch (no close wait)."
+    )
+    check_count = 0
+    while True:
+        try:
+            check_count += 1
+            for pair_code, pair_name in verified.items():
+                _worker_alert_check_pair(pair_code, pair_name)
+                time.sleep(0.6)
+            if check_count % 20 == 0:
+                _quiet_print(
+                    f"[WORKER-ALERT {datetime.now(timezone.utc):%H:%M:%S UTC}] "
+                    f"active (cycle #{check_count})"
+                )
+            time.sleep(WORKER_ALERT_CHECK_INTERVAL)
+        except Exception as e:
+            print(f"  [WORKER-ALERT] loop error: {e}")
+            time.sleep(WORKER_ALERT_CHECK_INTERVAL)
+
+
+# ==============================================================================
 # MAIN (original)
 # ==============================================================================
 def main():
@@ -2713,6 +2910,8 @@ def main():
     threading.Thread(target=live_comp_sampler_worker, daemon=True).start()
     threading.Thread(target=bb5_scanner_worker, daemon=True).start()
     threading.Thread(target=daily_bb_scanner_worker, daemon=True).start()
+    if WORKER_ALERT_ENABLED:
+        threading.Thread(target=worker_live_bb_alert_worker, daemon=True).start()
     if RELATIVE_VALUE_ENABLED:
         threading.Thread(target=_rv_worker, daemon=True).start()
     if TM_COMP_MONITOR_ENABLED:
