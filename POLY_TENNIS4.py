@@ -4297,6 +4297,16 @@ from flask import Flask
 app = Flask(__name__)
 _scanner_thread: Optional[threading.Thread] = None
 
+_scanner_started_lock = threading.Lock()
+
+
+@app.before_request
+def _ensure_scanner_started_once():
+    global _scanner_thread
+    with _scanner_started_lock:
+        if _scanner_thread is None or not _scanner_thread.is_alive():
+            _start_scanner_once()
+
 
 def _start_scanner_once():
     global _scanner_thread
@@ -4339,7 +4349,7 @@ def health():
             "scanner_thread_alive": alive}, 200
 
 
-_start_scanner_once()
+
 
 
 if __name__ == "__main__":
