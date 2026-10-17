@@ -48,6 +48,9 @@ from flask import Flask
 # MODIFICATION FLAGS..
 # ==============================================================================
 _QUIET_MODE = True
+
+_discord_block_until = 0.0          # ← ADD THIS
+
 TM_COMP_MONITOR_ENABLED = True
 TM_COMP_MONITOR_INTERVAL_SEC = 900
 TM_COMP_MONITOR_TITLE = "TM/COMP Monitor (Dual System)"
@@ -2772,6 +2775,32 @@ def _worker_alert_verify_pairs():
 
 
 def _worker_alert_send_discord(msg):
+    global _last_discord_send, _discord_block_until
+    if not msg:
+        return
+    if time.time() < _discord_block_until:
+        return
+    delta = time.time() - _last_discord_send
+    if delta < DISCORD_RATE_LIMIT_DELAY:
+        time.sleep(DISCORD_RATE_LIMIT_DELAY - delta)
+    try:
+        ok = RELAY.send(
+            title="BB Live Touch",
+            body=_sanitize_ascii(msg),
+            priority="high",
+            tags="discord",
+            target="discord",
+        )
+        _last_discord_send = time.time()
+        if not ok:
+            _discord_block_until = time.time() + 60
+            print("  ⚠️ Discord relay delivery failed — pausing 60s", flush=True)
+    except Exception as e:
+        _discord_block_until = time.time() + 60
+        print(f"  [WORKER-ALERT] relay error: {e}", flush=True)
+
+
+def _worker_alert_send_discord2(msg):
     """Route through the same PA relay path as send_discord_message()."""
     if not msg:
         return
@@ -3064,8 +3093,36 @@ DISCORD_WEBHOOK_URL = os.environ.get(
 DISCORD_RATE_LIMIT_DELAY = 5
 _last_discord_send = 0.0
 
-
 def send_discord_message(content):
+    global _last_discord_send, _discord_block_until
+    if not content:
+        return
+    if time.time() < _discord_block_until:
+        return
+    delta = time.time() - _last_discord_send
+    if delta < DISCORD_RATE_LIMIT_DELAY:
+        time.sleep(DISCORD_RATE_LIMIT_DELAY - delta)
+    try:
+        ok = RELAY.send(
+            title="Trade Map",
+            body=_sanitize_ascii(content),
+            priority="default",
+            tags="discord",
+            target="discord",
+        )
+        _last_discord_send = time.time()
+        if not ok:
+            _discord_block_until = time.time() + 60
+            print("  ⚠️ Discord relay delivery failed — pausing 60s", flush=True)
+    except Exception as e:
+        _discord_block_until = time.time() + 60
+        print(f"  ⚠️ Discord relay error: {e}", flush=True)
+
+
+
+
+
+def send_discord_message2(content):
     """Send Discord notification via the same PA relay (target=discord)."""
     global _last_discord_send
     if not content:
