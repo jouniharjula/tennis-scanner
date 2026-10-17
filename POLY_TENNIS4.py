@@ -42,7 +42,7 @@ from flask import Flask
 
 
 # ==============================================================================
-# MODIFICATION FLAGS
+# MODIFICATION FLAGS..
 # ==============================================================================
 _QUIET_MODE = True
 TM_COMP_MONITOR_ENABLED = True
