@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+
+
+#!/usr/bin/env python3
+import sys
+# Render runs us without a TTY → Python block-buffers stdout and logs vanish.
+# Force line-buffering + reconfigure stderr so print() is always visible.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 """
 Deribit Options & Kraken Supply/Demand Trade Map Scanner  (DUAL-SYSTEM EDITION)
 ================================================================================
